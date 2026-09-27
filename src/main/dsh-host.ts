@@ -6,10 +6,12 @@
 import { app } from 'electron'
 import { spawn, type ChildProcess } from 'node:child_process'
 import { createHash } from 'node:crypto'
+import { createServer } from 'node:net'
 import { fileURLToPath } from 'node:url'
 import { basename, delimiter, dirname, resolve, sep } from 'node:path'
 import {
   chmodSync,
+  cpSync,
   createReadStream,
   createWriteStream,
   existsSync,
@@ -23,10 +25,47 @@ import {
 } from 'node:fs'
 import { pipeline } from 'node:stream/promises'
 import { createBrotliDecompress } from 'node:zlib'
+import { writeMcpRuntimePatch } from './mcp-config'
+import { writeModelRuntimePatch } from './model-providers'
+import { writeAgentRuntimePatch } from './agent-runtime'
+import { resolveOcrPythonCandidate } from './ocr-service'
 
 const URL_LINE = /dsh web: (http:\/\/127\.0\.0\.1:\d+\/?\S*)/
 const BOOT_TIMEOUT_MS = 120_000
 const STOP_TIMEOUT_MS = 10_000
+
+/** The agent runtime and its skills should use the app-provided OCR interpreter,
+ * never a system Python they would then try to "fix" themselves. */
+function ocrPythonForRuntime(dshHome: string): string | undefined {
+  let pythonPathSetting = ''
+  try {
+    const parsed = JSON.parse(readFileSync(resolve(dshHome, 'ocr-settings.json'), 'utf8')) as { pythonPath?: unknown }
+    if (typeof parsed.pythonPath === 'string') pythonPathSetting = parsed.pythonPath
+  } catch {}
+  const resourceRoot = app.isPackaged
+    ? resolve(process.resourcesPath, 'lawclaw')
+    : resolve(resolveDesktopRoot(), 'resources/lawclaw')
+  return resolveOcrPythonCandidate(pythonPathSetting, resolveDesktopRoot(), resolve(resourceRoot, '..'))
+}
+
+async function reserveLoopbackPort(): Promise<number> {
+  return await new Promise<number>((resolveP, reject) => {
+    const server = createServer()
+    server.once('error', reject)
+    server.listen(0, '127.0.0.1', () => {
+      const address = server.address()
+      if (address === null || typeof address === 'string') {
+        server.close()
+        reject(new Error('Unable to reserve a loopback port for DSH.'))
+        return
+      }
+      server.close((error) => {
+        if (error !== undefined) reject(error)
+        else resolveP(address.port)
+      })
+    })
+  })
+}
 
 function resolveDesktopRoot(): string {
   const here = dirname(fileURLToPath(import.meta.url))
@@ -43,11 +82,55 @@ function resolveDshRoot(): string {
 /** Resolve the dsh home directory (override with DSH_HOME). Defaults to a
  * writable app data for packaged builds. Development keeps the repository-local
  * home so existing sessions are not displaced. */
-function resolveDshHome(): string {
+export function resolveDshHome(): string {
   const override = process.env.DSH_HOME
   if (override !== undefined && override !== '') return resolve(override)
   if (app.isPackaged) return resolve(app.getPath('userData'), 'dsh')
   return resolve(resolveDesktopRoot(), '.dsh-home')
+}
+
+export function syncLawClawSkills(enabledSkillIds: readonly string[]): void {
+  const resourceRoot = app.isPackaged
+    ? resolve(process.resourcesPath, 'lawclaw')
+    : resolve(resolveDesktopRoot(), 'resources/lawclaw')
+  const sourceRoot = resolve(resourceRoot, 'skills')
+  const targetRoot = resolve(resolveDshHome(), 'skills')
+  const markerPath = resolve(targetRoot, '.lawclaw-managed.json')
+  mkdirSync(targetRoot, { recursive: true })
+  let previous: string[] = []
+  try {
+    const parsed = JSON.parse(readFileSync(markerPath, 'utf8')) as { skills?: unknown }
+    if (Array.isArray(parsed.skills)) previous = parsed.skills.filter((item): item is string => typeof item === 'string')
+  } catch {}
+
+  const requested = [...new Set(enabledSkillIds)].filter((id) => /^[a-z0-9]+(?:-[a-z0-9]+)*$/u.test(id))
+  for (const id of new Set([...previous, ...requested])) {
+    const destination = resolve(targetRoot, id)
+    if (destination.startsWith(targetRoot + sep)) rmSync(destination, { recursive: true, force: true })
+  }
+  const sharedSource = resolve(sourceRoot, 'shared')
+  const sharedDestination = resolve(targetRoot, 'shared')
+  rmSync(sharedDestination, { recursive: true, force: true })
+  if (requested.length > 0 && existsSync(sharedSource)) cpSync(sharedSource, sharedDestination, { recursive: true })
+  for (const id of requested) {
+    const source = resolve(sourceRoot, id)
+    if (!source.startsWith(sourceRoot + sep) || !existsSync(resolve(source, 'SKILL.md'))) continue
+    const destination = resolve(targetRoot, id)
+    cpSync(source, destination, { recursive: true })
+    if (id === 'lawclaw-case-privacy') {
+      const scripts = resolve(destination, 'scripts')
+      mkdirSync(scripts, { recursive: true })
+      cpSync(resolve(resourceRoot, 'scripts/privacy/redact_case.py'), resolve(scripts, 'redact_case.py'))
+      cpSync(resolve(resourceRoot, 'scripts/privacy/restore_case.py'), resolve(scripts, 'restore_case.py'))
+    } else if (id === 'lawclaw-material-extraction') {
+      const scripts = resolve(destination, 'scripts')
+      mkdirSync(scripts, { recursive: true })
+      cpSync(resolve(resourceRoot, 'scripts/privacy/pdf_extract.py'), resolve(scripts, 'pdf_extract.py'))
+    } else if (id === 'lawclaw-troubleshooter') {
+      cpSync(resolve(resourceRoot, 'knowledge/LAWCLAW_TROUBLESHOOTER_KB.md'), resolve(destination, 'LAWCLAW_TROUBLESHOOTER_KB.md'))
+    }
+  }
+  writeFileSync(markerPath, JSON.stringify({ version: 1, skills: requested }, null, 2) + '\n', 'utf8')
 }
 
 function resolveNodeExecutable(): string {
@@ -60,6 +143,7 @@ interface DshLaunch {
   command: string
   prefix: string[]
   cwd: string
+  electronRunAsNode?: boolean
 }
 
 interface BundledRuntimeFile {
@@ -86,7 +170,7 @@ function readRuntimeManifest(runtimeDir: string): BundledRuntimeManifest | undef
   if (!existsSync(path)) return undefined
   const value = JSON.parse(readFileSync(path, 'utf8')) as Partial<BundledRuntimeManifest>
   if (value.version !== 1 || typeof value.executable !== 'string' || !Array.isArray(value.files)) {
-    throw new Error('内置 DSH 运行时 manifest 无效，请重新安装 DeepSeek Desktop。')
+    throw new Error('内置 DSH 运行时 manifest 无效，请重新安装 LawClaw Next。')
   }
   for (const file of value.files) {
     if (
@@ -148,8 +232,10 @@ async function materializeBundledRuntime(runtimeDir: string, filename: string, d
   return resolve(targetDir, filename)
 }
 
-/** Prefer the release-shaped DSH executable that carries the complete web
- * profile. DSH_RUNTIME_EXECUTABLE is useful for testing unreleased runtimes. */
+/** Prefer the npm DSH runtime executed by Electron's bundled Node. The current
+ * single-file SEA distribution has an upstream ESM fs export bug that breaks
+ * agent-preset discovery (`child.isDirectory is not a function`) during every
+ * session creation. Keep the self-contained executable only as a fallback. */
 async function resolveDshLaunch(dshHome: string): Promise<DshLaunch> {
   const explicitRuntime = process.env.DSH_RUNTIME_EXECUTABLE?.trim()
   if (explicitRuntime !== undefined && explicitRuntime !== '') {
@@ -167,6 +253,13 @@ async function resolveDshLaunch(dshHome: string): Promise<DshLaunch> {
     if (existsSync(bin)) return { command: resolveNodeExecutable(), prefix: [bin], cwd: root }
   }
 
+  const packagedDshBin = app.isPackaged
+    ? resolve(process.resourcesPath, 'app.asar/node_modules/@deepseek-ai/dsh/lib/bin.js')
+    : resolve(resolveDesktopRoot(), 'node_modules/@deepseek-ai/dsh/lib/bin.js')
+  if (existsSync(packagedDshBin)) {
+    return { command: process.execPath, prefix: ['--expose-internals', packagedDshBin], cwd: resolveDesktopRoot(), electronRunAsNode: true }
+  }
+
   const filename = runtimeFilename()
   if (filename !== undefined) {
     const runtimeDir = app.isPackaged
@@ -179,7 +272,7 @@ async function resolveDshLaunch(dshHome: string): Promise<DshLaunch> {
   }
 
   if (app.isPackaged) {
-    throw new Error('安装包缺少内置 DSH 运行时，请重新安装完整的 DeepSeek Desktop。')
+    throw new Error('安装包缺少内置 DSH 运行时，请重新安装完整的 LawClaw Next。')
   }
   throw new Error('未找到内置 DSH 运行时；开发模式请运行 pnpm runtime:sync，或构建相邻的 deepseek-harness-clean。')
 }
@@ -245,17 +338,55 @@ export async function startDshHost(): Promise<DshHostHandle> {
   const dshHome = resolveDshHome()
   mkdirSync(dshHome, { recursive: true })
   const launch = await resolveDshLaunch(dshHome)
+  const resourceRoot = app.isPackaged
+    ? resolve(process.resourcesPath, 'lawclaw')
+    : resolve(resolveDesktopRoot(), 'resources/lawclaw')
+  const desktopPatch = resolve(resourceRoot, 'dsh/desktop.patch.yml')
+  if (!existsSync(desktopPatch)) throw new Error(`LawClaw desktop patch is missing: ${desktopPatch}`)
   const desktopEnv = readDesktopEnv()
-  const child = spawn(launch.command, [...launch.prefix, 'web', '--port', '0', '--no-open'], {
+  const mcpRuntime = writeMcpRuntimePatch(dshHome)
+  const modelRuntime = writeModelRuntimePatch(dshHome)
+  const agentRuntime = writeAgentRuntimePatch(dshHome)
+  const port = await reserveLoopbackPort()
+  const patchArgs = [
+    '--patch', desktopPatch,
+    ...(modelRuntime.patchPath === undefined ? [] : ['--patch', modelRuntime.patchPath]),
+    ...(agentRuntime.patchPath === undefined ? [] : ['--patch', agentRuntime.patchPath]),
+    ...(mcpRuntime.patchPath === undefined ? [] : ['--patch', mcpRuntime.patchPath]),
+  ]
+  const ocrPython = ocrPythonForRuntime(dshHome)
+  const child = spawn(launch.command, [...launch.prefix, '--profile', 'web', ...patchArgs, '--port', String(port), '--no-open'], {
     cwd: launch.cwd,
-    env: { ...process.env, PATH: ensureBundledPnpmOnPath(dshHome), DSH_HOME: dshHome, ...desktopEnv },
+    windowsHide: true,
+    env: {
+      ...process.env,
+      PATH: ensureBundledPnpmOnPath(dshHome),
+      ...(launch.electronRunAsNode === true ? { ELECTRON_RUN_AS_NODE: '1' } : {}),
+      DSH_HOME: dshHome,
+      LAWCLAW_OCR_CONFIG: resolve(dshHome, 'ocr-settings.json'),
+      ...(ocrPython === undefined ? {} : { LAWCLAW_OCR_PYTHON: ocrPython }),
+      ...desktopEnv,
+      ...modelRuntime.env,
+      ...mcpRuntime.env,
+    },
     stdio: ['ignore', 'pipe', 'pipe'],
   })
 
   const url = await new Promise<string>((resolveP, reject) => {
     const timer = setTimeout(() => reject(new Error(`dsh web did not announce a URL within ${String(BOOT_TIMEOUT_MS)} ms`)), BOOT_TIMEOUT_MS)
+    let settled = false
     let stderrTail = ''
+    let stdoutTail = ''
+    const finish = (value: string): void => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      child.off('exit', onExit)
+      resolveP(value)
+    }
     const onExit = (code: number | null, signal: NodeJS.Signals | null): void => {
+      if (settled) return
+      settled = true
       clearTimeout(timer)
       reject(new Error(`dsh web exited before announcing (code=${String(code)} signal=${String(signal)})${stderrTail === '' ? '' : `\n${stderrTail.slice(-2048)}`}`))
     }
@@ -263,19 +394,20 @@ export async function startDshHost(): Promise<DshHostHandle> {
     child.stdout?.setEncoding('utf8')
     child.stderr?.setEncoding('utf8')
     child.stdout?.on('data', (chunk: string) => {
-      const match = URL_LINE.exec(chunk)
+      stdoutTail = `${stdoutTail}${chunk}`.slice(-4096)
+      const match = URL_LINE.exec(stdoutTail)
       if (match !== null) {
-        clearTimeout(timer)
-        child.off('exit', onExit)
-        resolveP(match[1])
+        finish(match[1])
       }
     })
-    child.stderr?.on('data', (chunk: string) => { stderrTail = `${stderrTail}${chunk}`.slice(-4096) })
+    child.stderr?.on('data', (chunk: string) => {
+      stderrTail = `${stderrTail}${chunk}`.slice(-4096)
+      const match = URL_LINE.exec(stderrTail)
+      if (match !== null) finish(match[1])
+    })
     child.once('error', (error: Error) => { clearTimeout(timer); reject(new Error(`dsh web spawn failed: ${error.message}`)) })
   })
 
-  const portMatch = /:(\d+)/.exec(url)
-  const port = portMatch !== null ? Number(portMatch[1]) : 0
   return { port, url, child, stop: () => stopChild(child) }
 }
 
@@ -443,6 +575,7 @@ async function runPluginCommand(args: readonly string[]): Promise<string> {
   return await new Promise<string>((resolveP, reject) => {
     const child = spawn(launch.command, [...launch.prefix, 'plugin', '--profile', WEB_PROFILE, ...args], {
       cwd: launch.cwd,
+      windowsHide: true,
       env: { ...process.env, PATH: ensureBundledPnpmOnPath(dshHome), DSH_HOME: dshHome },
       stdio: ['ignore', 'pipe', 'pipe'],
     })

@@ -2,7 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { dsh } from '../dsh-client'
-import { useApp } from '../store'
+import { visibleLawClawText, visibleLawClawTitle } from '../lawclaw-display'
+import { useApp, type DesktopSession } from '../store'
 import type {
   ApprovalDecision, ContextPressureProjection, ImageAttachment, ModelCatalog, ModelSelection, PendingApproval,
   PermissionOption, PermissionSelectProjection, SessionEvent, SessionFollowEvent, SessionFollowFrame,
@@ -12,6 +13,13 @@ import { BrandMark, Icon } from './Icon'
 import {
   TrajectoryStrip, traceFromEvent, traceFromRecords, type TraceBlock,
 } from './TrajectoryStrip'
+import {
+  foldWorkflowProgress,
+  initialWorkflowProgress,
+  lawClawWorkflowStages,
+  workflowProgressFromRecords,
+  type LawClawWorkflowProgress,
+} from '../workflow-progress'
 
 interface Message {
   id: string
@@ -26,9 +34,9 @@ interface Message {
 }
 
 const suggestions = [
-  { icon: 'sparkles' as const, label: '梳理项目', prompt: '请分析当前项目结构，并给出最值得优先推进的三项工作。' },
-  { icon: 'activity' as const, label: '检查改动', prompt: '请检查当前代码的最近改动，找出潜在问题并提出修复建议。' },
-  { icon: 'shield' as const, label: '质量检查', prompt: '请运行适合本项目的类型检查和测试，并修复发现的问题。' },
+  { icon: 'sparkles' as const, label: '梳理案件材料', prompt: '请读取当前案件目录中的材料，先给出材料清单、关键事实时间线和待核实问题；不要补造材料中不存在的事实。' },
+  { icon: 'activity' as const, label: '形成案件分析', prompt: '请基于当前案件材料形成一份结构化案件分析，逐项标注事实依据、争议焦点和证据缺口。' },
+  { icon: 'shield' as const, label: '启动双重审查', prompt: '请先冻结当前分析稿并计算摘要，然后把同一份冻结稿分别交给对方律师和裁判者独立审查；等待两者完成后再汇总分歧与结论。' },
 ]
 
 const newId = (): string => Math.random().toString(36).slice(2, 10)
@@ -99,23 +107,47 @@ function eventFromRecord(record: unknown): SessionEvent | undefined {
   }
 }
 
+/** Merge a completed payload into the streamed accumulation without dropping
+ * earlier blocks: payloads may repeat only the last block or consolidate the
+ * whole message, so keep both sides when neither contains the other. */
+function mergeStreamedPart(previous: string, incoming: string): string {
+  if (incoming === '') return previous
+  if (previous === '' || previous === incoming || incoming.startsWith(previous)) return incoming
+  if (previous.endsWith(incoming) || previous.includes(incoming)) return previous
+  return `${previous}\n\n${incoming}`
+}
+
 function finishLastAssistant(messages: Message[], text?: string, reasoning?: string): Message[] {
   const last = messages.at(-1)
+  const incomingText = text ?? ''
+  const incomingReasoning = reasoning ?? ''
   if (last?.role !== 'assistant') {
-    if ((text === undefined || text === '') && (reasoning === undefined || reasoning === '')) return messages
+    if (incomingText === '' && incomingReasoning === '') return messages
     return [...messages, {
       id: newId(),
       role: 'assistant',
-      text: text ?? '',
-      ...(reasoning === undefined || reasoning === '' ? {} : { reasoning }),
-      ...(reasoning === undefined || reasoning === '' ? {} : { reasoningComplete: true }),
+      text: incomingText,
+      ...(incomingReasoning === '' ? {} : { reasoning: incomingReasoning, reasoningComplete: true }),
+      streaming: false,
     }]
   }
-  return [...messages.slice(0, -1), {
-    ...last,
-    text: text === undefined || text === '' ? last.text : text,
-    ...(reasoning === undefined || reasoning === '' ? {} : { reasoning }),
-    ...(last.reasoning === undefined && (reasoning === undefined || reasoning === '') ? {} : { reasoningComplete: true }),
+  if (last.streaming === true) {
+    // The finalized payload belongs to the message that is currently streaming.
+    return [...messages.slice(0, -1), {
+      ...last,
+      text: mergeStreamedPart(last.text, incomingText),
+      ...(incomingReasoning === '' && last.reasoning === undefined ? {} : { reasoning: mergeStreamedPart(last.reasoning ?? '', incomingReasoning), reasoningComplete: true }),
+      streaming: false,
+    }]
+  }
+  // The previous bubble is already finished; a new final message must never
+  // overwrite it — otherwise earlier step outputs disappear mid-run.
+  if (incomingText === '' && incomingReasoning === '') return messages
+  return [...messages, {
+    id: newId(),
+    role: 'assistant',
+    text: incomingText,
+    ...(incomingReasoning === '' ? {} : { reasoning: incomingReasoning, reasoningComplete: true }),
     streaming: false,
   }]
 }
@@ -128,6 +160,12 @@ function turnFailureText(event: SessionEvent): string | undefined {
   const message = typeof error?.message === 'string' && error.message.trim() !== ''
     ? error.message.trim()
     : '模型请求失败'
+  if (/MISSING_CREDENTIAL|no API key|DEEPSEEK_API_KEY/iu.test(message)) {
+    return '尚未配置当前模型的 API Key。请先前往“设置 → 模型”完成配置。'
+  }
+  if (/product is not activated|not activated products/iu.test(message)) {
+    return '当前厂商账户尚未开通这个模型。请前往“设置 → 模型”，先用模型右侧的测试按钮验证，再启用可用模型。'
+  }
   const code = typeof error?.code === 'string' && !message.includes(error.code)
     ? `（${error.code}）`
     : ''
@@ -155,7 +193,7 @@ function applyEvent(messages: Message[], event: SessionEvent): Message[] {
   if (event.type === 'user/message') {
     const source = asObject(data?.source)
     if (source?.kind !== 'user') return messages
-    const text = contentText(data?.content)
+    const text = visibleLawClawText(contentText(data?.content))
     const attachments = attachmentMeta(data?.content)
     if (text === '' && attachments.length === 0) return messages
     const lastUser = [...messages].reverse().find((message) => message.role === 'user')
@@ -170,9 +208,12 @@ function applyEvent(messages: Message[], event: SessionEvent): Message[] {
       const completed = assistantContent(chunk.block)
       const last = messages.at(-1)
       if (last?.role === 'assistant' && (last.reasoning !== undefined || completed.reasoning !== '')) {
+        // Deltas already accumulated every block; the end payload may repeat only
+        // the block that just closed, so merge instead of replacing wholesale.
+        const reasoning = mergeStreamedPart(last.reasoning ?? '', completed.reasoning)
         return [...messages.slice(0, -1), {
           ...last,
-          ...(completed.reasoning === '' ? {} : { reasoning: completed.reasoning }),
+          ...(reasoning === '' ? {} : { reasoning }),
           reasoningComplete: true,
         }]
       }
@@ -266,25 +307,16 @@ function conversationEntries(messages: readonly Message[]): ConversationEntry[] 
 
 function greeting(): string {
   const hour = new Date().getHours()
-  if (hour < 6) return '夜深了，也可以慢慢来'
-  if (hour < 11) return '早上好，准备构建什么？'
-  if (hour < 14) return '中午好，从一个想法开始'
-  if (hour < 19) return '下午好，继续把事情做成'
-  return '晚上好，准备构建什么？'
+  if (hour < 6) return '夜深了，先从核对案件材料开始'
+  if (hour < 11) return '早上好，今天先处理哪个案件？'
+  if (hour < 14) return '中午好，需要我梳理哪些材料？'
+  if (hour < 19) return '下午好，继续推进案件分析'
+  return '晚上好，需要我核对哪部分案件材料？'
 }
 
 function pathName(path: string | undefined): string {
-  if (path === undefined) return '选择项目'
+  if (path === undefined) return '选择案件目录'
   return path.replace(/[\\/]+$/, '').split(/[\\/]/).at(-1) ?? path
-}
-
-function comparableModelId(value: string): string {
-  return (value.split('/').at(-1) ?? value).toLowerCase().replace(/[^a-z0-9]+/gu, '')
-}
-
-function matchingModelId(ids: readonly string[], selected: string): string | undefined {
-  return ids.find((id) => id === selected)
-    ?? ids.find((id) => comparableModelId(id) === comparableModelId(selected))
 }
 
 const modelProviderNames: Readonly<Record<string, string>> = {
@@ -563,10 +595,149 @@ function compactTokenCount(tokens: number): string {
   return `${String(Math.round(safeTokens))} tok`
 }
 
+function LawClawCaseProgress({ progress, running, hasActivity, subagents, onOpenSubagent }: {
+  progress: LawClawWorkflowProgress
+  running: boolean
+  hasActivity: boolean
+  subagents: DesktopSession[]
+  onOpenSubagent: (id: string) => void
+}): React.ReactElement {
+  const completed = new Set(progress.completedStages)
+  const workflowCompleted = completed.size === lawClawWorkflowStages.length
+  const progressLabel = running
+    ? '案件流程'
+    : hasActivity ? `案件流程 · ${workflowCompleted ? '已完成' : '已停止'}` : '案件流程'
+  const runningCount = subagents.filter((item) => item.running).length
+  const visibleSubagents = subagents.slice(-3)
+  return (
+    <div className={`lawclaw-case-progress ${running ? 'is-running' : ''}`} aria-label="案件处理进度">
+      <div className="lawclaw-progress-label"><Icon name="branch" size={13} /><span>{progressLabel}</span></div>
+      <div className="lawclaw-progress-track">
+        <div className="lawclaw-progress-stages">
+        {lawClawWorkflowStages.map((stage, index) => (
+          <div
+            className={progress.failedStage === stage.id
+              ? 'is-failed'
+              : completed.has(stage.id)
+                ? 'is-complete'
+                : running && progress.activeStage === stage.id ? 'is-active' : ''}
+            key={stage.id}
+            title={progress.failedStage === stage.id ? progress.failureDetail : undefined}
+          >
+            <i>{completed.has(stage.id) ? <Icon name="check" size={9} /> : String(index + 1)}</i>
+            <span><strong>{stage.label}</strong></span>
+          </div>
+        ))}
+        </div>
+      </div>
+      {subagents.length > 0 && (
+        <div className="lawclaw-delegation-strip" aria-label="Main 已分派的子 Agent">
+          <span className="lawclaw-delegation-summary">
+            Main 已分派 {String(subagents.length)} 个子 Agent{runningCount > 0 ? `，${String(runningCount)} 个执行中` : '，当前均已结束'}
+          </span>
+          {visibleSubagents.map((item) => (
+            <button key={item.id} onClick={() => onOpenSubagent(item.id)} title={`查看 ${item.title}`} type="button">
+              {item.running && <span aria-hidden="true" className="mini-spinner" />}
+              <strong>{item.title}</strong>
+              <em>{item.running ? '执行中' : '已结束'}</em>
+            </button>
+          ))}
+          {subagents.length > visibleSubagents.length && (
+            <span className="lawclaw-delegation-more">+{String(subagents.length - visibleSubagents.length)}</span>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function SubagentDrawer({ session, onClose }: { session: DesktopSession; onClose: () => void }): React.ReactElement {
+  const [messages, setMessages] = useState<Message[]>([])
+  const [blocks, setBlocks] = useState<TraceBlock[]>([])
+  const [error, setError] = useState<string | undefined>()
+
+  useEffect(() => {
+    let disposed = false
+    let cancel: (() => void) | undefined
+    setMessages([])
+    setBlocks([])
+    setError(undefined)
+    if (session.parentId === undefined) {
+      setError('无法读取子 Agent：缺少父会话信息')
+      return () => { disposed = true }
+    }
+    void dsh.follow({
+      kind: 'subagent',
+      parentSessionId: session.parentId,
+      childSessionId: session.id,
+      mode: session.subagentMode ?? 'continuable',
+    }, (frame) => {
+      if (disposed) return
+      if (frame.type === 'snapshot') {
+        setMessages(historyFrom(frame.records))
+        setBlocks(traceFromRecords(frame.records))
+        return
+      }
+      const event = (frame as SessionFollowEvent).event
+      if (event.type === 'stream/error') {
+        setError(contentText(event.data) || '子任务事件流中断')
+        return
+      }
+      const block = traceFromEvent(event)
+      if (block !== undefined) setBlocks((current) => current.some((item) => item.id === block.id) ? current : [...current, block])
+      setMessages((current) => applyEvent(current, event))
+    }).then((stop) => {
+      if (disposed) stop()
+      else cancel = stop
+    }).catch((reason: unknown) => {
+      if (!disposed) setError(reason instanceof Error ? reason.message : String(reason))
+    })
+    return () => {
+      disposed = true
+      cancel?.()
+    }
+  }, [session.id, session.parentId, session.subagentMode])
+
+  const assignment = messages.find((message) => message.role === 'user')
+  const outputs = messages.filter((message) => message.role === 'assistant' && (message.text !== '' || message.reasoning !== ''))
+
+  return (
+    <aside className="inspector-panel subagent-panel">
+      <div className="inspector-heading subagent-heading">
+        <div><span className="eyebrow">DSH SUBAGENT</span><h2>{session.title}</h2><small>{session.running ? '正在执行' : '已结束'} · {session.id.slice(0, 8)}</small></div>
+        <button aria-label="关闭子 Agent 面板" className="icon-button subtle" onClick={onClose} type="button"><Icon name="close" size={15} /></button>
+      </div>
+      <div className="subagent-trajectory">
+        <span className="section-label">执行轨迹</span>
+        <TrajectoryStrip blocks={blocks} />
+      </div>
+      {error !== undefined && <div className="installed-plugin-error" role="alert"><Icon name="activity" size={14} /><span>{error}</span></div>}
+      <div className="subagent-scroll">
+        <section className="subagent-assignment">
+          <span className="section-label">Main 分派内容</span>
+          <p>{assignment?.text || '正在读取子任务说明…'}</p>
+        </section>
+        <section className="subagent-output">
+          <span className="section-label">过程与输出</span>
+          {outputs.length === 0
+            ? <div className="subagent-waiting"><span className={session.running ? 'mini-spinner' : ''} />{session.running ? '子 Agent 正在处理…' : '尚未生成可见输出'}</div>
+            : outputs.map((message) => (
+              <article key={message.id}>
+                {message.reasoning !== undefined && message.reasoning !== '' && <details><summary>过程摘要</summary><pre>{message.reasoning}</pre></details>}
+                {message.text !== '' && <div className="markdown-body"><ReactMarkdown remarkPlugins={[remarkGfm]}>{message.text}</ReactMarkdown></div>}
+              </article>
+            ))}
+        </section>
+      </div>
+    </aside>
+  )
+}
+
 export function ChatView(): React.ReactElement {
   const dshUrl = useApp((state) => state.dshUrl)
   const connectionError = useApp((state) => state.connectionError)
   const sessions = useApp((state) => state.sessions)
+  const subagents = useApp((state) => state.subagents)
   const activeSessionId = useApp((state) => state.activeSessionId)
   const patchSession = useApp((state) => state.patchSession)
   const addSession = useApp((state) => state.addSession)
@@ -597,6 +768,7 @@ export function ChatView(): React.ReactElement {
   const [catalogError, setCatalogError] = useState<string | undefined>()
   const [selectingModel, setSelectingModel] = useState(false)
   const [traceBySession, setTraceBySession] = useState<Record<string, TraceBlock[]>>({})
+  const [workflowBySession, setWorkflowBySession] = useState<Record<string, LawClawWorkflowProgress>>({})
   const [attachments, setAttachments] = useState<ImageAttachment[]>([])
   const [taskMenuOpen, setTaskMenuOpen] = useState(false)
   const [taskRenaming, setTaskRenaming] = useState(false)
@@ -610,14 +782,20 @@ export function ChatView(): React.ReactElement {
   const [fullAccessAcknowledged, setFullAccessAcknowledged] = useState(false)
   const [answeringApprovalId, setAnsweringApprovalId] = useState<string | undefined>()
   const [approvalError, setApprovalError] = useState<string | undefined>()
+  const [selectedSubagentId, setSelectedSubagentId] = useState<string | undefined>()
   const cancelFollowRef = useRef<(() => void) | undefined>(undefined)
   const endRef = useRef<HTMLDivElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const taskMenuRef = useRef<HTMLDivElement>(null)
   const composerRef = useRef<HTMLDivElement>(null)
   const messages = activeSessionId === undefined ? [] : messagesBySession[activeSessionId] ?? []
+  const activeSubagents = subagents.filter((session) => session.parentId === activeSessionId)
+  const selectedSubagent = activeSubagents.find((session) => session.id === selectedSubagentId)
   const groupedMessages = useMemo(() => conversationEntries(messages), [messages])
   const traceBlocks = activeSessionId === undefined ? [] : traceBySession[activeSessionId] ?? []
+  const workflowProgress = activeSessionId === undefined
+    ? initialWorkflowProgress()
+    : workflowBySession[activeSessionId] ?? initialWorkflowProgress()
   const pendingApproval = pendingApprovals.find((approval) => approval.sessionId === activeSessionId)
   const approvalCommand = useMemo(
     () => pendingApproval === undefined ? undefined : traceCommand(traceBlocks, pendingApproval),
@@ -663,48 +841,35 @@ export function ChatView(): React.ReactElement {
   }, [attachments, messages])
   const projectPaths = useMemo(() => [...new Set(sessions.flatMap((session) => session.cwd === undefined ? [] : [session.cwd]))], [sessions])
 
-  const loadModelCatalog = useCallback(async (refreshRemote = false): Promise<void> => {
+  const loadModelCatalog = useCallback(async (): Promise<void> => {
     if (dshUrl === undefined) return
     setCatalogLoading(true)
     setCatalogError(undefined)
     try {
-      let remoteIds: string[] | undefined
-      if (refreshRemote) {
-        const env = await window.desktop.settings.read()
-        const apiKey = env.DEEPSEEK_API_KEY?.trim()
-        const baseUrl = env.DEEPSEEK_BASE_URL?.trim()
-        if (apiKey !== undefined && apiKey !== '' && baseUrl !== undefined && baseUrl !== '') {
-          remoteIds = await window.desktop.models.fetch(baseUrl, apiKey)
-          if (remoteIds.length === 0) throw new Error('当前 Base URL 没有返回可用模型')
-          await dsh.updateDeepSeekModels(remoteIds.map((id) => ({
-            id,
-            name: id,
-            contextWindow: 64000,
-            maxTokens: 8192,
-            inputModalities: ['text'],
-          })))
-        }
-      }
-      let nextCatalog = await dsh.modelCatalog()
-      if (remoteIds !== undefined) {
-        const appState = useApp.getState()
-        const sessionId = appState.activeSessionId
-        const activeSelection = appState.sessions.find((session) => session.id === sessionId)?.selectedModel
-        const current = activeSelection ?? nextCatalog.default
-        const matched = current.provider === 'deepseek-official'
-          ? matchingModelId(remoteIds, current.model)
-          : undefined
-        if (sessionId !== undefined && matched !== undefined && matched !== current.model) {
-          const accepted = await dsh.selectModel({
-            sessionId,
-            provider: current.provider,
-            model: matched,
-          })
-          appState.patchSession(sessionId, { selectedModel: accepted.selected })
-          nextCatalog = await dsh.modelCatalog()
-        }
-      }
-      setCatalog(nextCatalog)
+      const [nextCatalog, providers] = await Promise.all([
+        dsh.modelCatalog(),
+        window.desktop.models.providers.read(),
+      ])
+      const enabledModels = new Map(providers
+        .filter((provider) => provider.enabled)
+        .map((provider) => [provider.route, new Set(provider.models.filter((model) => model.enabled).map((model) => model.id))]))
+      const groups = nextCatalog.groups.flatMap((group) => {
+        const allowed = enabledModels.get(group.id)
+        if (allowed === undefined) return []
+        const models = group.models.filter((model) => allowed.has(model.id))
+        return models.length === 0 ? [] : [{ ...group, models }]
+      })
+      const fallbackProvider = groups[0]
+      const fallback = fallbackProvider?.models[0]
+      const defaultIsEnabled = groups.some((group) => group.id === nextCatalog.default.provider && group.models.some((model) => model.id === nextCatalog.default.model))
+      setCatalog({
+        ...nextCatalog,
+        groups,
+        routableProviders: groups.map((group) => group.id),
+        default: defaultIsEnabled || fallback === undefined || fallbackProvider === undefined
+          ? nextCatalog.default
+          : { provider: fallbackProvider.id, model: fallback.id },
+      })
     } catch (reason) {
       setCatalogError(reason instanceof Error ? reason.message : String(reason))
     } finally {
@@ -721,15 +886,20 @@ export function ChatView(): React.ReactElement {
     setIsStreaming(activeSession?.running ?? false)
     if (activeSessionId === undefined || dshUrl === undefined) return
     let disposed = false
-    void dsh.follow(activeSessionId, (frame: SessionFollowFrame) => {
+    void dsh.follow({ kind: 'session', sessionId: activeSessionId }, (frame: SessionFollowFrame) => {
       if (disposed) return
       if (frame.type === 'snapshot') {
         setMessagesBySession((current) => ({ ...current, [activeSessionId]: historyFrom(frame.records) }))
         setMetricFoldsBySession((current) => ({ ...current, [activeSessionId]: metricsFrom(frame.records) }))
         setTraceBySession((current) => ({ ...current, [activeSessionId]: traceFromRecords(frame.records) }))
+        setWorkflowBySession((current) => ({ ...current, [activeSessionId]: workflowProgressFromRecords(frame.records) }))
         return
       }
       const event = (frame as SessionFollowEvent).event
+      setWorkflowBySession((current) => ({
+        ...current,
+        [activeSessionId]: foldWorkflowProgress(current[activeSessionId] ?? initialWorkflowProgress(), event),
+      }))
       setMetricFoldsBySession((current) => ({
         ...current,
         [activeSessionId]: foldSessionMetric(current[activeSessionId] ?? emptySessionMetricFold(), event),
@@ -759,7 +929,7 @@ export function ChatView(): React.ReactElement {
       }
       if (event.type === 'session/title') {
         const title = asObject(event.data)?.title
-        if (typeof title === 'string') patchSession(activeSessionId, { title })
+        if (typeof title === 'string') patchSession(activeSessionId, { title: visibleLawClawTitle(title) })
       }
       setMessagesBySession((current) => ({
         ...current,
@@ -790,6 +960,7 @@ export function ChatView(): React.ReactElement {
     setSwitchingPermission(undefined)
     setFullAccessConfirmation(false)
     setFullAccessAcknowledged(false)
+    setSelectedSubagentId(undefined)
   }, [activeSessionId])
 
   useEffect(() => {
@@ -872,7 +1043,7 @@ export function ChatView(): React.ReactElement {
       provider: modelProviderName(model.id, group.name),
     }))
   )) ?? [], [catalog])
-  const selectedModelLabel = availableModels.find((model) => model.value === modelValue)?.label ?? selectedModel?.model ?? '加载模型…'
+  const selectedModelLabel = availableModels.find((model) => model.value === modelValue)?.label ?? (availableModels.length === 0 ? '未配置提供商' : selectedModel?.model ?? '选择模型')
   const lastUserMessageId = [...messages].reverse().find((message) => message.role === 'user')?.id
 
   async function switchProject(path: string): Promise<void> {
@@ -895,7 +1066,7 @@ export function ChatView(): React.ReactElement {
 
   async function openTerminal(): Promise<void> {
     if (environmentPath === undefined) {
-      setError('请先选择一个项目目录')
+      setError('请先选择一个案件目录')
       return
     }
     try {
@@ -987,6 +1158,15 @@ export function ChatView(): React.ReactElement {
   async function send(textOverride?: string): Promise<void> {
     const text = (textOverride ?? input).trim()
     if ((text === '' && attachments.length === 0) || activeSessionId === undefined || dshUrl === undefined || isStreaming) return
+    const providers = await window.desktop.models.providers.read()
+    const configuredProvider = providers.find((provider) => provider.route === selectedModel?.provider && provider.enabled)
+    const configuredModel = configuredProvider?.models.some((model) => model.id === selectedModel?.model && model.enabled) ?? false
+    if (!configuredModel) {
+      setError('请先配置并启用模型提供商。')
+      localStorage.setItem('deepseek-desktop:settings-tab', 'models')
+      setView('settings')
+      return
+    }
     const requestId = newId()
     const outgoingAttachments = attachments
     setInput('')
@@ -1154,7 +1334,7 @@ export function ChatView(): React.ReactElement {
             <Icon name="menu" size={17} />
           </button>
           <Icon className="chat-title-folder" name="folder" size={16} />
-          <h1>{activeSession?.title ?? 'DeepSeek Harness'}</h1>
+          <h1>{activeSession === undefined ? 'LawClaw 案件工作台' : visibleLawClawTitle(activeSession.title)}</h1>
           <span className="chat-project-name">{pathName(activeSession?.cwd ?? workspaceRoot)}</span>
           <div className="chat-task-menu titlebar-no-drag" ref={taskMenuRef}>
             <button aria-expanded={taskMenuOpen} aria-haspopup="menu" aria-label="任务菜单" className="chat-header-more" disabled={activeSession === undefined} onClick={() => { setTaskMenuOpen((open) => !open); setTaskRenaming(false); setTaskArchiveConfirm(false) }} type="button">
@@ -1189,13 +1369,13 @@ export function ChatView(): React.ReactElement {
         </div>
         <div className="header-actions titlebar-no-drag">
           <button aria-label="在项目目录打开终端" className="icon-button" disabled={environmentPath === undefined} onClick={() => void openTerminal()} type="button"><Icon name="terminal" size={16} /></button>
-          <button aria-label="切换运行面板" className={`icon-button ${inspectorOpen ? 'is-active' : ''}`} onClick={toggleInspector} type="button">
+          <button aria-label="切换运行面板" className={`icon-button ${inspectorOpen || selectedSubagent !== undefined ? 'is-active' : ''}`} onClick={() => { setSelectedSubagentId(undefined); toggleInspector() }} type="button">
             <Icon name="panel" size={16} />
           </button>
         </div>
       </header>
 
-      <TrajectoryStrip blocks={traceBlocks} />
+      <LawClawCaseProgress progress={workflowProgress} running={isStreaming} hasActivity={messages.length > 0} subagents={activeSubagents} onOpenSubagent={setSelectedSubagentId} />
 
       {fullAccessConfirmation && (
         <div
@@ -1234,7 +1414,7 @@ export function ChatView(): React.ReactElement {
         </div>
       )}
 
-      <div className={`chat-workbench ${inspectorOpen ? 'has-inspector' : ''}`}>
+      <div className={`chat-workbench ${inspectorOpen || selectedSubagent !== undefined ? 'has-inspector' : ''}`}>
         <section className="conversation-shell">
           <div className="message-scroller">
             {error !== undefined && (
@@ -1246,6 +1426,19 @@ export function ChatView(): React.ReactElement {
             )}
             {connectionError !== undefined && error === undefined && (
               <div className="notice notice-error"><span><Icon name="activity" size={16} /></span><p>{connectionError}</p></div>
+            )}
+
+            {activeSubagents.length > 0 && (
+              <div className="lawclaw-dispatch-list" aria-label="Main 已分派的子任务">
+                {activeSubagents.map((subagent) => (
+                  <button className={selectedSubagentId === subagent.id ? 'is-selected' : ''} key={subagent.id} onClick={() => setSelectedSubagentId(subagent.id)} type="button">
+                    <span className="dispatch-icon"><Icon name="branch" size={15} /></span>
+                    <span><small>Main 已分派子任务</small><strong>{subagent.title}</strong></span>
+                    <em className={subagent.running ? 'is-running' : 'is-inactive'}>{subagent.running ? '执行中' : '已结束'}</em>
+                    <Icon name="chevron-right" size={14} />
+                  </button>
+                ))}
+              </div>
             )}
 
             {messages.length === 0 ? (
@@ -1286,7 +1479,7 @@ export function ChatView(): React.ReactElement {
                     <div className="assistant-rail"><BrandMark size={24} /></div>
                     <div className="assistant-content">
                       <div className="message-meta">
-                        <span>DeepSeek</span>
+                        <span>LawClaw Main</span>
                         {entry.messages.some((message) => message.streaming === true) && <small className="working-label"><i />正在工作</small>}
                       </div>
                       <div className="assistant-step-list">
@@ -1350,23 +1543,10 @@ export function ChatView(): React.ReactElement {
                     <Icon className="composer-chevron" name="chevron-down" size={13} />
                   </button>
                     <div aria-hidden={composerMenu !== 'project'} className={`composer-popover composer-project-popover ${composerMenu === 'project' ? 'is-open' : ''}`}>
-                      <span className="composer-popover-label">项目</span>
+                      <span className="composer-popover-label">案件目录</span>
                       {projectPaths.map((path) => <button className={path === environmentPath ? 'is-selected' : ''} key={path} onClick={() => void switchProject(path)} type="button"><Icon name="folder" size={14} /><span>{pathName(path)}</span>{path === environmentPath && <Icon name="check" size={14} />}</button>)}
                       <div className="composer-popover-divider" />
-                      <button onClick={() => void chooseProject()} type="button"><Icon name="plus" size={14} /><span>打开其他项目…</span></button>
-                    </div>
-                </div>
-                <span className="context-divider" />
-                <div className="composer-menu-anchor">
-                  <button className={composerMenu === 'worktree' ? 'is-open' : ''} onClick={() => setComposerMenu((current) => current === 'worktree' ? undefined : 'worktree')} type="button">
-                    <Icon name="branch" size={15} />
-                    <span>working tree</span>
-                    <Icon className="composer-chevron" name="chevron-down" size={13} />
-                  </button>
-                    <div aria-hidden={composerMenu !== 'worktree'} className={`composer-popover composer-worktree-popover ${composerMenu === 'worktree' ? 'is-open' : ''}`}>
-                      <span className="composer-popover-label">工作树</span>
-                      <div className="composer-info-row"><Icon name="check" size={14} /><span><strong>当前工作树</strong><small>{environmentPath ?? '未绑定目录'}</small></span></div>
-                      {environment?.isGit === true && <><div className="composer-popover-divider" /><span className="composer-popover-label">分支</span>{environment.branches.slice(0, 8).map((branch) => <div className={`composer-info-row ${branch === environment.branch ? 'is-current' : ''}`} key={branch}><Icon name="branch" size={14} /><span><strong>{branch}</strong><small>{branch === environment.branch ? '当前分支' : '可用于新工作树'}</small></span></div>)}</>}
+                      <button onClick={() => void chooseProject()} type="button"><Icon name="plus" size={14} /><span>添加其他案件目录…</span></button>
                     </div>
                 </div>
               </div>
@@ -1385,7 +1565,7 @@ export function ChatView(): React.ReactElement {
                     void send()
                   }
                 }}
-                placeholder={ready ? '向 DeepSeek 提问，使用 @ 添加上下文，使用 / 选择能力' : '正在准备…'}
+                placeholder={ready ? '向 LawClaw 提问，使用 @ 添加案件材料，使用 / 选择能力' : '正在准备…'}
                 ref={textareaRef}
                 rows={1}
                 value={input}
@@ -1426,17 +1606,17 @@ export function ChatView(): React.ReactElement {
                 </div>
                 <div className="composer-submit">
                   <div className="composer-menu-anchor model-menu-anchor">
-                    <button aria-expanded={composerMenu === 'model'} aria-haspopup="listbox" className={`composer-model-button ${composerMenu === 'model' ? 'is-open' : ''}`} disabled={selectingModel || activeSessionId === undefined} onClick={() => { const opening = composerMenu !== 'model'; setComposerMenu(opening ? 'model' : undefined); if (opening) void loadModelCatalog(true) }} type="button"><span>{selectedModelLabel}</span><Icon className="composer-chevron" name="chevron-down" size={13} /></button>
+                    <button aria-expanded={composerMenu === 'model'} aria-haspopup="listbox" className={`composer-model-button ${composerMenu === 'model' ? 'is-open' : ''}`} disabled={selectingModel || activeSessionId === undefined} onClick={() => { const opening = composerMenu !== 'model'; setComposerMenu(opening ? 'model' : undefined); if (opening) void loadModelCatalog() }} type="button"><span>{selectedModelLabel}</span><Icon className="composer-chevron" name="chevron-down" size={13} /></button>
                       <div aria-hidden={composerMenu !== 'model'} className={`composer-popover composer-model-popover ${composerMenu === 'model' ? 'is-open' : ''}`} role="listbox">
                         {catalogLoading && <div className="composer-popover-state"><span className="mini-spinner" />正在读取模型目录…</div>}
-                        {!catalogLoading && catalogError !== undefined && <div className="composer-popover-state is-error"><span>{catalogError}</span><button onClick={() => void loadModelCatalog(true)} type="button">重试</button></div>}
+                        {!catalogLoading && catalogError !== undefined && <div className="composer-popover-state is-error"><span>{catalogError}</span><button onClick={() => void loadModelCatalog()} type="button">重试</button></div>}
                         {!catalogLoading && catalogError === undefined && availableModels.length > 0 && <>
-                          <span className="composer-popover-label">当前 Base URL · {availableModels.length} 个模型</span>
+                          <span className="composer-popover-label">已启用 · {availableModels.length} 个模型</span>
                           <div className="composer-model-list">
                             {availableModels.map((model) => <button aria-selected={model.value === modelValue} className={model.value === modelValue ? 'is-selected' : ''} key={model.value} onClick={() => { setComposerMenu(undefined); void selectModel(model.value) }} role="option" type="button"><span><strong>{model.label}</strong><small>{model.provider}</small></span>{model.value === modelValue && <Icon name="check" size={14} />}</button>)}
                           </div>
                         </>}
-                        {!catalogLoading && catalogError === undefined && availableModels.length === 0 && <div className="composer-popover-state"><span>还没有可用模型</span><button onClick={() => { localStorage.setItem('deepseek-desktop:settings-tab', 'models'); setComposerMenu(undefined); setView('settings') }} type="button">配置模型</button></div>}
+                        {!catalogLoading && catalogError === undefined && availableModels.length === 0 && <div className="composer-popover-state"><span>未配置提供商</span><button onClick={() => { localStorage.setItem('deepseek-desktop:settings-tab', 'models'); setComposerMenu(undefined); setView('settings') }} type="button">新建提供商</button></div>}
                       </div>
                   </div>
                   {isStreaming ? (
@@ -1456,7 +1636,9 @@ export function ChatView(): React.ReactElement {
           </div>
         </section>
 
-        {inspectorOpen && (
+        {selectedSubagent !== undefined && <SubagentDrawer onClose={() => setSelectedSubagentId(undefined)} session={selectedSubagent} />}
+
+        {selectedSubagent === undefined && inspectorOpen && (
           <aside className="inspector-panel environment-panel">
             <div className="inspector-heading">
               <div><span className="eyebrow">LOCAL WORKSPACE</span><h2>环境信息</h2></div>

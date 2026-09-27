@@ -3,7 +3,14 @@ out/
 release/
 *.tsbuildinfo
 .dsh-home/
+.dsh-inspect/
+.dsh-native-test*/
+.runlogs/
 .artifacts/
+resources/ocr-runtime/
 .codeartsdoer/
 .visual-check/
-resources/dsh-runtime/*.br
+.runtime-download/
+__pycache__/
+*.py[cod]
+.lawclaw-dev.*

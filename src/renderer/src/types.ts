@@ -1,5 +1,124 @@
 /** Renderer-side destination. */
-export type View = 'chat' | 'plugins' | 'automations' | 'settings'
+export type View = 'chat' | 'skills' | 'automations' | 'settings'
+
+export interface LawClawSkill {
+  id: string
+  name: string
+  description: string
+  category: 'legal' | 'privacy' | 'documents' | 'operations'
+  version: string
+  source: 'lawclaw'
+  entrypoints: string[]
+  compatibleAgents: string[]
+  enabled: boolean
+}
+
+export interface LawClawAgent {
+  id: string
+  name: string
+  role: string
+  description: string
+  enabled: boolean
+  provider: string
+  model: string
+  skills: string[]
+  order: number
+  nextAgents: string[]
+}
+
+export interface OcrSettings {
+  mode: 'local' | 'cloud'
+  gpuEnabled: boolean
+  pythonPath: string
+  threads: number
+  dpi: number
+  memoryLimitMb: number
+  cloudProvider: 'zai' | 'custom'
+  cloudEndpoint: string
+  cloudApiKey: string
+  cloudModel: string
+  termsUrl: string
+  privacyUrl: string
+}
+
+export interface OcrCapabilities {
+  ready: boolean
+  pythonPath?: string
+  providers: string[]
+  gpuProvider?: string
+  hardwareGpu?: string
+  reason?: string
+}
+
+export interface OcrBenchmarkResult {
+  status: 'good' | 'slow' | 'unavailable'
+  pages: number
+  sourcePages: number
+  seconds: number
+  secondsPerPage: number
+  peakMemoryMb: number
+  projectedMinutes100Pages: number
+  projectedMinutes1000Pages: number
+  provider: string
+  gpuEnabled: boolean
+  message: string
+}
+
+export interface McpServerConfig {
+  id: string
+  name: string
+  serverName: string
+  enabled: boolean
+  transport: 'stdio' | 'streamable-http'
+  command: string
+  args: string[]
+  cwd: string
+  env: Record<string, string>
+  url: string
+  headers: Record<string, string>
+  toolCallTimeoutMs: number
+}
+
+export interface McpTestResult {
+  serverName: string
+  toolCount: number
+  tools: string[]
+  message: string
+}
+
+export interface DesktopModelEntry {
+  id: string
+  name: string
+  enabled: boolean
+  contextWindow: number
+  maxTokens: number
+  vision: boolean
+}
+
+export interface DesktopModelProvider {
+  id: string
+  route: string
+  name: string
+  enabled: boolean
+  apiFormat: 'openai-completions' | 'anthropic-messages'
+  baseUrl: string
+  apiKey: string
+  models: DesktopModelEntry[]
+}
+
+export interface ModelProviderTestResult {
+  message: string
+  models: Array<{ id: string, name: string, vision?: boolean }>
+}
+
+export interface ModelTestResult { message: string }
+
+export interface RuntimeConfigStatus {
+  status: 'idle' | 'applying' | 'applied' | 'error'
+  scopes: Array<'models' | 'agents'>
+  message: string
+  updatedAt: number
+}
 
 /** A GitHub repository from the dsh-plugin topic search. */
 export interface PluginRepo {
@@ -107,6 +226,9 @@ export interface SessionSummary {
 }
 
 export interface SessionListValue { items: readonly SessionSummary[] }
+export type SessionFollowAddress =
+  | { kind: 'session', sessionId: string }
+  | { kind: 'subagent', parentSessionId: string, childSessionId: string, mode: 'one-shot' | 'continuable' }
 export interface SessionCreateRequest { workspaceId?: string, cwd?: string, sessionId?: string, agentPreset?: string }
 export interface SessionCreateValue { sessionId: string, agentPreset?: string }
 export interface SessionPromptRequest {
@@ -268,6 +390,30 @@ export interface DesktopApi {
     setEnabled: (name: string, enabled: boolean) => Promise<PluginMutationResult>
     uninstall: (name: string) => Promise<PluginMutationResult>
   }
+  skills: {
+    list: () => Promise<LawClawSkill[]>
+    setEnabled: (id: string, enabled: boolean) => Promise<LawClawSkill[]>
+  }
+  agents: {
+    list: () => Promise<LawClawAgent[]>
+    save: (agents: LawClawAgent[]) => Promise<LawClawAgent[]>
+  }
+  mcp: {
+    read: () => Promise<McpServerConfig[]>
+    save: (servers: McpServerConfig[]) => Promise<McpServerConfig[]>
+    test: (server: McpServerConfig) => Promise<McpTestResult>
+  }
+  ocr: {
+    read: () => Promise<OcrSettings>
+    save: (settings: OcrSettings) => Promise<OcrSettings>
+    capabilities: () => Promise<OcrCapabilities>
+    installGpuAcceleration: () => Promise<{ gpuProvider: string }>
+    provision: () => Promise<{ pythonPath: string }>
+    chooseBenchmarkFile: () => Promise<string | undefined>
+    benchmark: (filePath: string) => Promise<OcrBenchmarkResult>
+    chooseCloudFile: () => Promise<string | undefined>
+    testCloud: (filePath: string, explicitlyAuthorized: boolean) => Promise<unknown>
+  }
   settings: {
     read: () => Promise<Record<string, string>>
     write: (env: Record<string, string>) => Promise<string>
@@ -279,7 +425,20 @@ export interface DesktopApi {
     openTerminal: (path: string) => Promise<void>
   }
   attachments: { chooseImages: () => Promise<ImageAttachment[]> }
-  models: { fetch: (baseUrl: string, apiKey: string) => Promise<string[]> }
+  models: {
+    fetch: (baseUrl: string, apiKey: string) => Promise<string[]>
+    providers: {
+      read: () => Promise<DesktopModelProvider[]>
+      save: (providers: DesktopModelProvider[]) => Promise<DesktopModelProvider[]>
+      test: (provider: DesktopModelProvider) => Promise<ModelProviderTestResult>
+      testModel: (provider: DesktopModelProvider, modelId: string) => Promise<ModelTestResult>
+    }
+  }
+  runtime: {
+    configStatus: () => Promise<RuntimeConfigStatus>
+    restart: () => Promise<string | undefined>
+    onConfigStatus: (handler: (status: RuntimeConfigStatus) => void) => () => void
+  }
 }
 
 declare global {

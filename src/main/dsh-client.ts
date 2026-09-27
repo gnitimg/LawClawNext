@@ -6,7 +6,6 @@
  * behalf of the renderer, forwarding stream frames over IPC.
  */
 import { randomUUID } from 'node:crypto'
-import { EventEmitter } from 'node:events'
 import { WebSocket } from 'ws'
 
 interface RpcResultOk<T> { ok: true, value: T }
@@ -61,7 +60,9 @@ export async function createDshApiProxy(hostUrl: string, onFrame: (frame: Stream
   const headers = { cookie, 'content-type': 'application/json' }
 
   let ws: WebSocket | undefined
-  const streams = new Map<string, EventEmitter>()
+  // Stream state only needs membership tracking. Using EventEmitter here made
+  // DSH's ordinary `error` stream frame a fatal, unhandled Node `error` event.
+  const streams = new Set<string>()
   const pendingOpens = new Map<string, { resolve: () => void, reject: (e: Error) => void }>()
 
   function ensureWs(): WebSocket {
@@ -72,15 +73,14 @@ export async function createDshApiProxy(hostUrl: string, onFrame: (frame: Stream
       try { frame = JSON.parse(raw.toString()) } catch { return }
       const sid = frame.streamId
       if (sid === undefined) return
-      const emitter = streams.get(sid)
-      if (emitter === undefined) return
-      if (frame.type === 'item') { emitter.emit('item', frame.value); onFrame({ streamId: sid, type: 'item', value: frame.value }) }
-      else if (frame.type === 'error') { emitter.emit('error', frame.error); onFrame({ streamId: sid, type: 'error', error: frame.error }); streams.delete(sid) }
-      else if (frame.type === 'end') { emitter.emit('end'); onFrame({ streamId: sid, type: 'end' }); streams.delete(sid) }
+      if (!streams.has(sid)) return
+      if (frame.type === 'item') onFrame({ streamId: sid, type: 'item', value: frame.value })
+      else if (frame.type === 'error') { onFrame({ streamId: sid, type: 'error', error: frame.error }); streams.delete(sid) }
+      else if (frame.type === 'end') { onFrame({ streamId: sid, type: 'end' }); streams.delete(sid) }
       else if (frame.type === 'open') { const p = pendingOpens.get(sid); if (p !== undefined) { pendingOpens.delete(sid); p.resolve() } }
     })
     socket.on('error', (err: Error) => { for (const [, p] of pendingOpens) p.reject(new Error(`ws error: ${err.message}`)); pendingOpens.clear() })
-    socket.on('close', () => { for (const [, em] of streams) { em.emit('end'); onFrame({ streamId: em.eventNames()[0] as string, type: 'end' }) }; streams.clear() })
+    socket.on('close', () => { for (const streamId of streams) onFrame({ streamId, type: 'end' }); streams.clear() })
     ws = socket
     return socket
   }
@@ -94,8 +94,7 @@ export async function createDshApiProxy(hostUrl: string, onFrame: (frame: Stream
 
   function openStream(endpoint: string, args: unknown): string {
     const streamId = randomUUID()
-    const emitter = new EventEmitter()
-    streams.set(streamId, emitter)
+    streams.add(streamId)
     const socket = ensureWs()
     const send = (): void => {
       const openFrame = { type: 'open', streamId, endpoint, payload: { args } }

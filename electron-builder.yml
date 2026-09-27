@@ -1,14 +1,16 @@
 {
-  "appId": "com.deepseek.desktop",
-  "productName": "DeepSeek Desktop",
-  "artifactName": "DeepSeek-Desktop-${version}-${arch}.${ext}",
+  "appId": "io.lawclaw.next",
+  "productName": "LawClaw Next",
+  "artifactName": "LawClaw-Next-${version}-${arch}.${ext}",
   "asar": true,
   "electronDist": "node_modules/electron/dist",
   "npmRebuild": false,
   "directories": { "buildResources": "build", "output": "release" },
   "files": ["out/**", "package.json", "!out/**/*.map"],
   "extraResources": [
-    { "from": "resources/dsh-runtime", "to": "dsh-runtime", "filter": ["**/*"] }
+    { "from": "resources/dsh-runtime", "to": "dsh-runtime", "filter": ["**/*"] },
+    { "from": "resources/lawclaw", "to": "lawclaw", "filter": ["**/*"] },
+    { "from": "resources/ocr-runtime", "to": "ocr-runtime", "filter": ["**/*"] }
   ],
   "win": {
     "target": [{ "target": "nsis", "arch": ["x64"] }],
@@ -20,7 +22,7 @@
     "allowToChangeInstallationDirectory": true,
     "createDesktopShortcut": true,
     "createStartMenuShortcut": true,
-    "shortcutName": "DeepSeek Desktop",
+    "shortcutName": "LawClaw Next",
     "deleteAppDataOnUninstall": false
   },
   "publish": null

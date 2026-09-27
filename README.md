@@ -1,6 +1,6 @@
-# DeepSeek Desktop
+# LawClaw Next
 
-DeepSeek Harness（dsh）智能体的原生桌面客户端。采用 codex / zcode 风格 UI，完整复用 dsh 核心（everything-is-a-plugin、DeepSeek 模型适配、缓存命中），并内置实时插件市场。
+面向法律工作的原生多 Agent 桌面客户端。底层复用 DeepSeek Harness（DSH）的会话、子 Agent、模型路由、工具与技能系统，上层提供 LawClaw 的案件流程、隐私能力和双重审查体验。
 
 **自包含发行**：安装包内置完整 DSH 运行时与 pnpm，终端用户无需安装 Node.js、无需检出 dsh 源码仓库。首次启动时桌面端将校验过的运行时展开到应用数据目录并复用。
 
@@ -10,7 +10,10 @@ DeepSeek Harness（dsh）智能体的原生桌面客户端。采用 codex / zcod
 - **任务对话**：流式输出、任务控制、转向（steer）、取消，支持图片附件（最多 20 张 / 单张 5 MB）
 - **模型选择**：多 provider 路由、推理强度（reasoning effort）配置，模型目录懒加载并带加载/错误/空状态
 - **项目集成**：选择本地项目目录、读取 Git 分支 / 改动 / **worktree 列表**、一键打开 PowerShell 终端
-- **插件市场**：从 GitHub `topic:dsh-plugin` 实时拉取插件并一键安装到 web profile（通过内置 pnpm，用户无需自装）
+- **五 Agent 协作**：Main、主办律师、对方律师审查、法官审查、修理工分工协作
+- **真实子任务**：Main 使用 DSH session-backed subagent 派发任务，右侧抽屉展示子任务事件轨迹与输出
+- **技能市场**：管理随应用发布的 LawClaw 本地技能，并同步到 `<DSH_HOME>/skills`
+- **法律能力迁移**：内置材料抽取、隐私脱敏/恢复、故障诊断和案件清理留存规则
 - **自动化**：定时 / 周期任务调度视图
 - **外观主题**：浅色 / 深色 / 跟随系统，自定义标题栏
 - **设置热重载**：写入凭证 / 环境后自动重启 dsh host，无需重启应用
@@ -32,7 +35,7 @@ DeepSeek Harness（dsh）智能体的原生桌面客户端。采用 codex / zcod
 ## 项目结构
 
 ```
-deepseek-desktop/
+lawclaw-next/
 ├─ src/
 │  ├─ main/            # Electron 主进程
 │  │  ├─ index.ts      # 窗口、IPC、生命周期、host 热重启
@@ -45,12 +48,13 @@ deepseek-desktop/
 │        ├─ store.ts          # Zustand 全局状态
 │        ├─ types.ts          # dsh API 类型定义
 │        ├─ dsh-client.ts     # 渲染端 dsh 调用封装
-│        └─ components/       # Sidebar / ChatView / PluginMarket /
+│        └─ components/       # Sidebar / ChatView / SkillMarket /
 │                           #   AutomationsView / SettingsView 等
 ├─ scripts/
 │  ├─ ensure-electron.mjs
 │  └─ sync-dsh-runtime.mjs    # 从相邻 DSH 源码生成本地内置运行时
 ├─ resources/dsh-runtime/     # 内置运行时资源（manifest + license；.br 由 sync 生成）
+├─ resources/lawclaw/         # LawClaw 技能、原生脚本与迁移知识库
 ├─ electron.vite.config.ts
 ├─ electron-builder.yml
 └─ package.json
@@ -93,7 +97,7 @@ pnpm pack:win
 pnpm dist:win
 ```
 
-产物命名：`DeepSeek-Desktop-<version>-x64.exe`，支持自定义安装路径、创建桌面与开始菜单快捷方式。安装包通过 `extraResources` 携带 `resources/dsh-runtime`，运行时在用户机器上展开到应用数据目录。
+产物命名：`LawClaw-Next-<version>-x64.exe`，支持自定义安装路径、创建桌面与开始菜单快捷方式。安装包通过 `extraResources` 携带 DSH 运行时与 LawClaw 技能资源。
 
 ## 配置
 

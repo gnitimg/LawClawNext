@@ -3,6 +3,7 @@ import { dsh } from '../dsh-client'
 import { useApp, type DesktopSession } from '../store'
 import type { ScheduleRecord } from '../types'
 import { Icon } from './Icon'
+import { WorkflowSettingsPane } from './WorkflowSettingsPane'
 
 type ScheduleKind = 'after' | 'at' | 'every'
 
@@ -68,6 +69,7 @@ export function AutomationsView(): React.ReactElement {
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | undefined>()
   const [feedback, setFeedback] = useState<string | undefined>()
   const [error, setError] = useState<string | undefined>()
+  const [section, setSection] = useState<'workflow' | 'schedules'>('workflow')
 
   const automations = useMemo<AutomationItem[]>(() => sessions.flatMap((session) => {
     const projected = projectionBaselines[session.id]?.values.schedule
@@ -177,14 +179,19 @@ export function AutomationsView(): React.ReactElement {
     <div className="surface-view automation-view">
       <header className="surface-header titlebar-drag">
         <div className="surface-heading">
-          <span className="eyebrow">HARNESS SCHEDULE</span>
-          <h1>自动化 <span className="market-count">{automations.length}</span></h1>
+          <span className="eyebrow">LAWCLAW AUTOMATION</span>
+          <h1>自动化</h1>
         </div>
-        <button className="button button-primary titlebar-no-drag" disabled={sessions.length === 0} onClick={() => openComposer()} type="button">
+        {section === 'schedules' && <button className="button button-primary titlebar-no-drag" disabled={sessions.length === 0} onClick={() => openComposer()} type="button">
           <Icon name="plus" size={16} />新建自动化
-        </button>
+        </button>}
       </header>
       <div className="automation-canvas">
+        <div className="automation-section-tabs" role="tablist" aria-label="自动化功能">
+          <button aria-selected={section === 'workflow'} className={section === 'workflow' ? 'is-active' : ''} onClick={() => setSection('workflow')} role="tab" type="button"><Icon name="branch" size={16} />协作工作流</button>
+          <button aria-selected={section === 'schedules'} className={section === 'schedules' ? 'is-active' : ''} onClick={() => setSection('schedules')} role="tab" type="button"><Icon name="clock" size={16} />计划任务{automations.length > 0 && <span>{automations.length}</span>}</button>
+        </div>
+        {section === 'workflow' ? <WorkflowSettingsPane embedded /> : <>
         {(controlError !== undefined || error !== undefined) && <div className="notice notice-error automation-notice"><span><Icon name="activity" size={16} /></span><p>{error ?? controlError}</p></div>}
         {feedback !== undefined && <div className="notice automation-notice"><span><Icon name="check" size={16} /></span><p>{feedback}</p><button onClick={() => setFeedback(undefined)} type="button"><Icon name="close" size={14} /></button></div>}
         {automations.length === 0 ? (
@@ -219,6 +226,7 @@ export function AutomationsView(): React.ReactElement {
             </div>
           </div>
         )}
+        </>}
       </div>
 
       {dialogOpen && (

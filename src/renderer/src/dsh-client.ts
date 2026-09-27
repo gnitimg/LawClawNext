@@ -6,7 +6,7 @@ import type {
   SessionRenameRequest, SessionRenameValue, StreamFrameEvent, WorkspaceArchiveSessionRequest,
   WorkspaceArchiveValue, WorkspaceCreateRequest, WorkspaceCreateValue, WorkspaceDeleteRequest,
   WorkspaceDeleteValue, WorkspaceInsertBeforeRequest, WorkspaceOrderValue, WorkspaceRenameRequest,
-  WorkspaceValue, CommandExecutionValue, RemoteEventDownlinkFrame, RemoteEventResult,
+  WorkspaceValue, CommandExecutionValue, RemoteEventDownlinkFrame, RemoteEventResult, SessionFollowAddress,
 } from './types'
 
 type FrameHandler = (frame: SessionFollowFrame) => void
@@ -68,6 +68,9 @@ async function openRemoteStream<T>(
 
 async function rpc<T>(method: string, args: unknown): Promise<T> {
   const result = await window.desktop.dsh.rpc(method, args) as RpcResult<T>
+  if (result === undefined || result === null || typeof result !== 'object' || typeof result.ok !== 'boolean') {
+    throw new Error('后台服务暂未返回有效结果，请稍后重试。')
+  }
   if (!result.ok) throw new Error(`${result.error.code}: ${result.error.message}`)
   return result.value
 }
@@ -103,9 +106,9 @@ export const dsh = {
     rpc<unknown>('$events/result', result),
 
   /** Open a session/follow stream. Returns a cancel function. */
-  follow: async (sessionId: string, handler: FrameHandler): Promise<() => void> => {
+  follow: async (address: SessionFollowAddress, handler: FrameHandler): Promise<() => void> => {
     return await openRemoteStream<SessionFollowFrame>('session/follow', {
-      request: { address: { kind: 'session', sessionId } },
+      request: { address },
     }, handler, (error) => handler({
       type: 'event',
       event: { type: 'stream/error', seq: -1, time: new Date().toISOString(), data: { error } },

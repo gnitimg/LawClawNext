@@ -1,10 +1,11 @@
 import { useEffect } from 'react'
 import { AutomationsView } from './components/AutomationsView'
 import { ChatView } from './components/ChatView'
-import { PluginMarket } from './components/PluginMarket'
+import { SkillMarket } from './components/SkillMarket'
 import { SettingsView } from './components/SettingsView'
 import { Sidebar } from './components/Sidebar'
 import { dsh } from './dsh-client'
+import { visibleLawClawTitle } from './lawclaw-display'
 import { useApp, type DesktopSession } from './store'
 import type { ModelSelection, RemoteEventDownlinkFrame, SessionControlFrame, SessionSummary } from './types'
 
@@ -15,19 +16,27 @@ function pathName(path: string | undefined): string | undefined {
 
 function toDesktopSession(summary: SessionSummary): DesktopSession {
   const projectedTitle = summary.projections?.values.title
+  const projectedSubagent = summary.projections?.values.subagent
+  const subagentMode = projectedSubagent !== null
+    && typeof projectedSubagent === 'object'
+    && ('mode' in projectedSubagent)
+    && (projectedSubagent.mode === 'one-shot' || projectedSubagent.mode === 'continuable')
+    ? projectedSubagent.mode
+    : undefined
   const selectedModel = summary.projections?.values.modelSelection?.next
     ?? summary.projections?.values.modelSelection?.lastUsed
     ?? undefined
   return {
     id: summary.sessionId,
     title: typeof projectedTitle === 'string' && projectedTitle.trim() !== ''
-      ? projectedTitle
+      ? visibleLawClawTitle(projectedTitle)
       : summary.blank ? '新任务' : pathName(summary.cwd) ?? '未命名任务',
     updatedAt: summary.updatedAt,
     running: summary.running,
     blank: summary.blank,
     ...(summary.cwd === undefined ? {} : { cwd: summary.cwd }),
     ...(summary.parentSessionId === undefined ? {} : { parentId: summary.parentSessionId }),
+    ...(subagentMode === undefined ? {} : { subagentMode }),
     ...(selectedModel === undefined ? {} : { selectedModel }),
   }
 }
@@ -46,6 +55,7 @@ function projectedModel(value: unknown): ModelSelection | undefined {
 export function App(): React.ReactElement {
   const view = useApp((state) => state.view)
   const replaceSessions = useApp((state) => state.replaceSessions)
+  const replaceSubagents = useApp((state) => state.replaceSubagents)
   const setConnection = useApp((state) => state.setConnection)
   const sidebarCollapsed = useApp((state) => state.sidebarCollapsed)
   const patchSession = useApp((state) => state.patchSession)
@@ -59,6 +69,7 @@ export function App(): React.ReactElement {
   const connectionRevision = useApp((state) => state.connectionRevision)
   const reconnectDsh = useApp((state) => state.reconnectDsh)
   const appearance = useApp((state) => state.appearance)
+  const dshUrl = useApp((state) => state.dshUrl)
 
   useEffect(() => window.desktop.dsh.onHostRestarted(reconnectDsh), [reconnectDsh])
 
@@ -136,7 +147,7 @@ export function App(): React.ReactElement {
           if (frame.type === 'projection') {
             updateProjection(frame.sessionId, frame.key, frame.value, frame.seq)
             if (frame.key === 'title' && typeof frame.value === 'string') {
-              patchSession(frame.sessionId, { title: frame.value })
+              patchSession(frame.sessionId, { title: visibleLawClawTitle(frame.value) })
             } else if (frame.key === 'modelSelection') {
               const selectedModel = projectedModel(frame.value)
               if (selectedModel !== undefined) patchSession(frame.sessionId, { selectedModel })
@@ -154,9 +165,8 @@ export function App(): React.ReactElement {
         })
         const listed = await dsh.listSessions()
         if (disposed) return
-        const sessions = listed.items
-          .filter((item) => item.origin !== 'subagent')
-          .map(toDesktopSession)
+        const sessions = listed.items.filter((item) => item.origin !== 'subagent').map(toDesktopSession)
+        replaceSubagents(listed.items.filter((item) => item.origin === 'subagent').map(toDesktopSession))
         if (sessions.length > 0) {
           replaceSessions(sessions)
           return
@@ -173,14 +183,31 @@ export function App(): React.ReactElement {
       cancelEvents?.()
       clearPendingApprovals()
     }
-  }, [clearPendingApprovals, connectionRevision, patchSession, removePendingApproval, replaceSessions, setConnection, setControlBaseline, setControlError, setControlJobs, updateProjection, upsertPendingApproval])
+  }, [clearPendingApprovals, connectionRevision, patchSession, removePendingApproval, replaceSessions, replaceSubagents, setConnection, setControlBaseline, setControlError, setControlJobs, updateProjection, upsertPendingApproval])
+
+  useEffect(() => {
+    if (dshUrl === undefined) return
+    let disposed = false
+    const refresh = (): void => {
+      void dsh.listSessions().then((listed) => {
+        if (disposed) return
+        replaceSubagents(listed.items.filter((item) => item.origin === 'subagent').map(toDesktopSession))
+      }).catch(() => {})
+    }
+    refresh()
+    const timer = window.setInterval(refresh, 2_500)
+    return () => {
+      disposed = true
+      window.clearInterval(timer)
+    }
+  }, [dshUrl, replaceSubagents])
 
   return (
-    <div className={`app-shell ${sidebarCollapsed ? 'is-sidebar-collapsed' : ''}`}>
-      <Sidebar />
+    <div className={`app-shell ${sidebarCollapsed ? 'is-sidebar-collapsed' : ''} ${view === 'settings' ? 'is-settings-mode' : ''}`}>
+      {view !== 'settings' && <Sidebar />}
       <main className="workspace-stage">
         {view === 'chat' && <ChatView />}
-        {view === 'plugins' && <PluginMarket />}
+        {view === 'skills' && <SkillMarket />}
         {view === 'automations' && <AutomationsView />}
         {view === 'settings' && <SettingsView />}
       </main>

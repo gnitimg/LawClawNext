@@ -1,7 +1,8 @@
 {
-  "name": "deepseek-desktop",
+  "name": "lawclaw-next",
   "version": "0.1.0",
-  "description": "DeepSeek Desktop: a native desktop application for the DeepSeek Harness agent, with a codex/zcode-style UI, full dsh core reuse, and a live plugin marketplace.",
+  "packageManager": "pnpm@10.33.0",
+  "description": "LawClaw Next: a native, local-first legal agent workstation built on the DeepSeek Harness runtime.",
   "private": true,
   "type": "module",
   "main": "./out/main/index.js",
@@ -18,11 +19,15 @@
     "build": "electron-vite build",
     "preview": "electron-vite preview",
     "typecheck": "tsc --noEmit -p tsconfig.node.json --composite false && tsc --noEmit -p tsconfig.web.json --composite false",
+    "test": "node --import tsx --test tests/*.test.ts",
     "runtime:sync": "node scripts/sync-dsh-runtime.mjs",
-    "pack:win": "npm run runtime:sync && npm run build && electron-builder --win --x64 --dir",
-    "dist:win": "npm run runtime:sync && npm run build && electron-builder --win nsis --x64"
+    "ocr:sync": "node scripts/sync-ocr-runtime.mjs",
+    "pack:win": "npm run runtime:sync && npm run ocr:sync && npm run build && electron-builder --win --x64 --dir",
+    "dist:win": "npm run runtime:sync && npm run ocr:sync && npm run build && electron-builder --win nsis --x64"
   },
   "dependencies": {
+    "@deepseek-ai/dsh": "0.1.5-rc.2",
+    "@modelcontextprotocol/sdk": "1.30.0",
     "pnpm": "10.33.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
@@ -43,13 +48,8 @@
     "electron-vite": "5.0.0",
     "postcss": "^8.4.49",
     "tailwindcss": "^3.4.17",
+    "tsx": "4.21.0",
     "typescript": "~5.9.3",
     "vite": "^7.3.6"
-  },
-  "pnpm": {
-    "onlyBuiltDependencies": [
-      "esbuild",
-      "electron"
-    ]
   }
 }

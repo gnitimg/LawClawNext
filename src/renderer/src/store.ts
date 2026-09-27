@@ -4,9 +4,27 @@ import type { ModelSelection, PendingApproval, SessionJob, SessionProjectionBase
 const PINNED_SESSIONS_KEY = 'deepseek-desktop.pinned-sessions.v1'
 const ARCHIVED_SESSIONS_KEY = 'deepseek-desktop.archived-sessions.v1'
 const APPEARANCE_KEY = 'deepseek-desktop.appearance.v1'
+const DEVELOPER_MODE_KEY = 'deepseek-desktop.developer-mode.v1'
 export const PROJECT_PREFERENCES_KEY = 'deepseek-desktop.project-preferences.v1'
 
 export type Appearance = 'light' | 'dark' | 'system'
+
+function readDeveloperMode(): boolean {
+  return localStorage.getItem(DEVELOPER_MODE_KEY) === 'true'
+}
+
+export type ToastKind = 'error' | 'success' | 'info'
+
+export interface AppToast {
+  id: number
+  kind: ToastKind
+  text: string
+}
+
+const TOAST_DURATION_MS: Record<ToastKind, number> = { error: 8000, success: 3200, info: 5200 }
+
+let toastSequence = 0
+const toastTimers = new Map<number, ReturnType<typeof setTimeout>>()
 
 function readAppearance(): Appearance {
   const value = localStorage.getItem(APPEARANCE_KEY)
@@ -43,6 +61,7 @@ export interface DesktopSession {
   blank: boolean
   cwd?: string
   parentId?: string
+  subagentMode?: 'one-shot' | 'continuable'
   selectedModel?: ModelSelection
 }
 
@@ -50,8 +69,10 @@ interface AppState {
   view: View
   setView: (view: View) => void
   sessions: DesktopSession[]
+  subagents: DesktopSession[]
   activeSessionId: string | undefined
   replaceSessions: (sessions: DesktopSession[]) => void
+  replaceSubagents: (sessions: DesktopSession[]) => void
   addSession: (session: DesktopSession) => void
   patchSession: (id: string, patch: Partial<DesktopSession>) => void
   removeSession: (id: string) => void
@@ -76,6 +97,8 @@ interface AppState {
   setAgentPreset: (preset: string) => void
   appearance: Appearance
   setAppearance: (appearance: Appearance) => void
+  developerMode: boolean
+  setDeveloperMode: (developerMode: boolean) => void
   projectionBaselines: Record<string, SessionProjectionBaseline>
   controlJobs: Record<string, readonly SessionJob[]>
   controlError: string | undefined
@@ -90,12 +113,16 @@ interface AppState {
   upsertPendingApproval: (approval: PendingApproval) => void
   removePendingApproval: (eventId: string) => void
   clearPendingApprovals: () => void
+  toasts: AppToast[]
+  pushToast: (kind: ToastKind, text: string) => void
+  dismissToast: (id: number) => void
 }
 
 export const useApp = create<AppState>((set) => ({
   view: 'chat',
   setView: (view) => set({ view }),
   sessions: [],
+  subagents: [],
   activeSessionId: undefined,
   replaceSessions: (incoming) => set((state) => {
     const sessions = incoming.filter((session) => !state.archivedSessionIds.includes(session.id))
@@ -110,6 +137,7 @@ export const useApp = create<AppState>((set) => ({
       workspaceRoot: active?.cwd,
     }
   }),
+  replaceSubagents: (subagents) => set({ subagents }),
   addSession: (session) => set((state) => ({
     sessions: [session, ...state.sessions.filter((item) => item.id !== session.id)],
     activeSessionId: session.id,
@@ -172,6 +200,11 @@ export const useApp = create<AppState>((set) => ({
     localStorage.setItem(APPEARANCE_KEY, appearance)
     set({ appearance })
   },
+  developerMode: readDeveloperMode(),
+  setDeveloperMode: (developerMode) => {
+    localStorage.setItem(DEVELOPER_MODE_KEY, String(developerMode))
+    set({ developerMode })
+  },
   projectionBaselines: {},
   controlJobs: {},
   controlError: undefined,
@@ -208,4 +241,20 @@ export const useApp = create<AppState>((set) => ({
     pendingApprovals: state.pendingApprovals.filter((item) => item.eventId !== eventId),
   })),
   clearPendingApprovals: () => set({ pendingApprovals: [] }),
+  toasts: [],
+  pushToast: (kind, text) => {
+    const id = ++toastSequence
+    set((state) => ({
+      toasts: [...state.toasts.filter((item) => !(item.kind === kind && item.text === text)), { id, kind, text }],
+    }))
+    toastTimers.set(id, setTimeout(() => useApp.getState().dismissToast(id), TOAST_DURATION_MS[kind]))
+  },
+  dismissToast: (id) => {
+    const timer = toastTimers.get(id)
+    if (timer !== undefined) {
+      clearTimeout(timer)
+      toastTimers.delete(id)
+    }
+    set((state) => ({ toasts: state.toasts.filter((item) => item.id !== id) }))
+  },
 }))

@@ -4,23 +4,44 @@
  */
 import { app, BrowserWindow, dialog, ipcMain, nativeTheme, shell } from 'electron'
 import { fileURLToPath } from 'node:url'
-import { dirname, join } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { basename, extname } from 'node:path'
-import { readFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { existsSync, statSync } from 'node:fs'
 import { execFile, spawn } from 'node:child_process'
 import {
   startDshHost,
+  syncLawClawSkills,
   type DshHostHandle,
   installPlugin,
   listInstalledPlugins,
   readDesktopEnv,
+  resolveDshHome,
   setPluginEnabled,
   uninstallPlugin,
   writeDesktopEnv,
   type PluginMutation,
 } from './dsh-host'
 import { createDshApiProxy, type DshApiProxy } from './dsh-client'
+import { httpFailureMessage } from './http-error'
+import {
+  DEFAULT_OCR_SETTINGS,
+  benchmarkOcr,
+  inspectOcrCapabilities,
+  installOcrGpuAcceleration,
+  invokeCloudOcr,
+  normalizeOcrSettings,
+  provisionOcrRuntime,
+  type OcrSettings,
+} from './ocr-service'
+import { readMcpServers, testMcpServer, writeMcpServers } from './mcp-config'
+import { readModelProviders, testModelProvider, testProviderModel, writeModelProviders } from './model-providers'
+import { normalizeAgents, type LawClawAgent } from './agent-runtime'
+import {
+  DEFAULT_ENABLED_SKILL_IDS,
+  discoverLawClawSkills,
+  type LawClawSkill,
+} from './skill-catalog'
 
 const here = dirname(fileURLToPath(import.meta.url))
 
@@ -30,6 +51,111 @@ let mainWindow: BrowserWindow | undefined
 let isQuitting = false
 let isRestartingHost = false
 let pluginMutationQueue: Promise<void> = Promise.resolve()
+let modelRuntimeReloadTimer: ReturnType<typeof setTimeout> | undefined
+let pendingRuntimeScopes = new Set<'models' | 'agents'>()
+
+interface RuntimeConfigStatus {
+  status: 'idle' | 'applying' | 'applied' | 'error'
+  scopes: Array<'models' | 'agents'>
+  message: string
+  updatedAt: number
+}
+
+let runtimeConfigStatus: RuntimeConfigStatus = {
+  status: 'idle',
+  scopes: [],
+  message: '',
+  updatedAt: Date.now(),
+}
+
+interface LawClawConfig {
+  version: 2
+  enabledSkills: string[]
+  agents: LawClawAgent[]
+  ocr: OcrSettings
+}
+
+let skillCatalogCache: LawClawSkill[] | undefined
+
+function lawclawConfigPath(): string {
+  return join(app.getPath('userData'), 'lawclaw-next.json')
+}
+
+function normalizedAgents(value: unknown): LawClawAgent[] {
+  let providers: ReturnType<typeof readModelProviders> = []
+  try { providers = readModelProviders() } catch {}
+  return normalizeAgents(value, new Set(lawClawSkills().map((skill) => skill.id)), providers)
+}
+
+function readLawClawConfig(): LawClawConfig {
+  const fallback: LawClawConfig = {
+    version: 2,
+    enabledSkills: DEFAULT_ENABLED_SKILL_IDS.filter((id) => lawClawSkills().some((skill) => skill.id === id)),
+    agents: normalizedAgents(undefined),
+    ocr: DEFAULT_OCR_SETTINGS,
+  }
+  try {
+    const parsed = JSON.parse(readFileSync(lawclawConfigPath(), 'utf8')) as Partial<LawClawConfig> & { version?: number }
+    const knownSkills = new Set(lawClawSkills().map((skill) => skill.id))
+    const storedSkills = Array.isArray(parsed.enabledSkills)
+      ? parsed.enabledSkills.filter((id): id is string => typeof id === 'string' && knownSkills.has(id))
+      : fallback.enabledSkills
+    const enabledSkills = parsed.version === 2
+      ? storedSkills
+      : [...new Set([...storedSkills, ...fallback.enabledSkills])]
+    return {
+      version: 2,
+      enabledSkills,
+      agents: normalizedAgents(parsed.agents),
+      ocr: normalizeOcrSettings(parsed.ocr),
+    }
+  } catch {
+    return fallback
+  }
+}
+
+function syncOcrRuntimeSettings(settings: OcrSettings): void {
+  const target = join(resolveDshHome(), 'ocr-settings.json')
+  mkdirSync(dirname(target), { recursive: true })
+  writeFileSync(target, JSON.stringify({
+    gpuEnabled: settings.gpuEnabled,
+    threads: settings.threads,
+    dpi: settings.dpi,
+    memoryLimitMb: settings.memoryLimitMb,
+  }, null, 2) + '\n', 'utf8')
+}
+
+function desktopRoot(): string {
+  return resolve(here, '../..')
+}
+
+function lawClawResourcesRoot(): string {
+  return app.isPackaged ? process.resourcesPath : desktopRoot()
+}
+
+function lawClawContentRoot(): string {
+  return app.isPackaged
+    ? resolve(process.resourcesPath, 'lawclaw')
+    : resolve(desktopRoot(), 'resources/lawclaw')
+}
+
+function lawClawSkills(): LawClawSkill[] {
+  skillCatalogCache ??= discoverLawClawSkills(lawClawContentRoot())
+  return skillCatalogCache
+}
+
+function writeLawClawConfig(config: LawClawConfig): void {
+  const destination = lawclawConfigPath()
+  const temporary = destination + '.tmp'
+  mkdirSync(dirname(destination), { recursive: true })
+  writeFileSync(temporary, JSON.stringify(config, null, 2) + '\n', 'utf8')
+  renameSync(temporary, destination)
+}
+
+function listLawClawSkills(): Array<LawClawSkill & { enabled: boolean }> {
+  const enabled = new Set(readLawClawConfig().enabledSkills)
+  return lawClawSkills().map((skill) => ({ ...skill, entrypoints: [...skill.entrypoints], compatibleAgents: [...skill.compatibleAgents], enabled: enabled.has(skill.id) }))
+}
 
 function queuePluginMutation<T>(operation: () => Promise<T>): Promise<T> {
   const pending = pluginMutationQueue.then(operation, operation)
@@ -115,8 +241,15 @@ function syncWindowChrome(): void {
 function observeHostExit(current: DshHostHandle): void {
   current.child.on('exit', (code, signal) => {
     if (isQuitting || isRestartingHost || current !== host) return
-    dialog.showErrorBox('DeepSeek Desktop', `The dsh host exited unexpectedly (code=${String(code)} signal=${String(signal)}). The application will close.`)
-    void shutdown()
+    proxy?.dispose()
+    proxy = undefined
+    host = undefined
+    void restartDshHost().catch((error: unknown) => {
+      dialog.showErrorBox(
+        'LawClaw 服务恢复失败',
+        `后台服务意外停止（code=${String(code)}，signal=${String(signal)}），自动恢复未成功。\n\n${errorMessage(error)}\n\n请保留当前窗口并重新启动 LawClaw Next；案件数据不会因此删除。`,
+      )
+    })
   })
 }
 
@@ -144,6 +277,34 @@ async function restartDshHost(): Promise<string> {
   } finally {
     isRestartingHost = false
   }
+}
+
+function publishRuntimeConfigStatus(next: RuntimeConfigStatus): void {
+  runtimeConfigStatus = next
+  mainWindow?.webContents.send('runtime:config-status', next)
+}
+
+function scheduleRuntimeReload(scope: 'models' | 'agents'): void {
+  pendingRuntimeScopes.add(scope)
+  publishRuntimeConfigStatus({
+    status: 'applying',
+    scopes: [...pendingRuntimeScopes],
+    message: '正在应用配置…',
+    updatedAt: Date.now(),
+  })
+  if (modelRuntimeReloadTimer !== undefined) clearTimeout(modelRuntimeReloadTimer)
+  modelRuntimeReloadTimer = setTimeout(() => {
+    modelRuntimeReloadTimer = undefined
+    const scopes = [...pendingRuntimeScopes]
+    pendingRuntimeScopes = new Set()
+    void queuePluginMutation(async () => {
+      await restartDshHost()
+      publishRuntimeConfigStatus({ status: 'applied', scopes, message: '配置已应用', updatedAt: Date.now() })
+    }).catch((error: unknown) => {
+      console.error('Unable to reload model provider configuration:', error)
+      publishRuntimeConfigStatus({ status: 'error', scopes, message: `配置应用失败：${errorMessage(error)}`, updatedAt: Date.now() })
+    })
+  }, 500)
 }
 
 /** Fetch the live plugin list from GitHub topic dsh-plugin (server-side, no CORS). */
@@ -212,7 +373,7 @@ function createWindow(): void {
     height: 900,
     minWidth: 1000,
     minHeight: 640,
-    title: 'DeepSeek Desktop',
+    title: 'LawClaw Next',
     show: false,
     autoHideMenuBar: true,
     backgroundColor: '#f7f7f4',
@@ -230,7 +391,17 @@ function createWindow(): void {
     },
   })
 
-  mainWindow.once('ready-to-show', () => mainWindow?.show())
+  const revealWindow = (): void => {
+    if (mainWindow !== undefined && !mainWindow.isDestroyed() && !mainWindow.isVisible()) mainWindow.show()
+  }
+  mainWindow.once('ready-to-show', revealWindow)
+  mainWindow.webContents.once('did-finish-load', revealWindow)
+  mainWindow.webContents.once('did-fail-load', (_event, code, description) => {
+    revealWindow()
+    dialog.showErrorBox('LawClaw Next', `界面加载失败（${String(code)}）：${description}`)
+  })
+  const revealFallback = setTimeout(revealWindow, 5_000)
+  mainWindow.once('closed', () => clearTimeout(revealFallback))
   syncWindowChrome()
   mainWindow.webContents.setWindowOpenHandler(({ url: target }) => {
     if (target.startsWith('http://127.0.0.1:') || target.startsWith('https://127.0.0.1:')) return { action: 'allow' }
@@ -245,10 +416,13 @@ function createWindow(): void {
 
 async function bootstrap(): Promise<void> {
   try {
+    const lawClawConfig = readLawClawConfig()
+    syncLawClawSkills(lawClawConfig.enabledSkills)
+    syncOcrRuntimeSettings(lawClawConfig.ocr)
     host = await startDshHost()
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
-    dialog.showErrorBox('DeepSeek Desktop', `Failed to start the dsh host.\n\n${message}\n\n请重新安装完整的 DeepSeek Desktop。`)
+    dialog.showErrorBox('LawClaw Next 启动失败', `无法启动案件分析服务。\n\n${message}\n\n请重新安装完整的 LawClaw Next；已有案件数据不会被删除。`)
     app.quit()
     return
   }
@@ -259,7 +433,7 @@ async function bootstrap(): Promise<void> {
     proxy = await createDshApiProxy(host.url, (frame) => { mainWindow?.webContents.send('dsh:stream:frame', frame) })
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
-    dialog.showErrorBox('DeepSeek Desktop', `Failed to authenticate with the dsh host.\n\n${message}`)
+    dialog.showErrorBox('LawClaw Next', `Failed to authenticate with the dsh host.\n\n${message}`)
     void shutdown()
     return
   }
@@ -302,6 +476,98 @@ async function bootstrap(): Promise<void> {
   ipcMain.handle('plugins:uninstall', (_event, name: string) => {
     return queuePluginMutation(() => uninstallPluginSafely(name))
   })
+  ipcMain.handle('skills:list', () => listLawClawSkills())
+  ipcMain.handle('skills:set-enabled', (_event, id: string, enabled: boolean) => {
+    if (typeof id !== 'string' || !lawClawSkills().some((skill) => skill.id === id)) throw new Error('未知技能：' + String(id))
+    if (typeof enabled !== 'boolean') throw new Error('技能启用状态无效')
+    const config = readLawClawConfig()
+    const selected = new Set(config.enabledSkills)
+    if (enabled) selected.add(id)
+    else selected.delete(id)
+    writeLawClawConfig({ ...config, enabledSkills: [...selected] })
+    syncLawClawSkills([...selected])
+    return listLawClawSkills()
+  })
+  ipcMain.handle('agents:list', () => readLawClawConfig().agents)
+  ipcMain.handle('agents:save', (_event, agents: unknown) => {
+    const config = readLawClawConfig()
+    const normalized = normalizedAgents(agents)
+    writeLawClawConfig({ ...config, agents: normalized })
+    scheduleRuntimeReload('agents')
+    return normalized
+  })
+  ipcMain.handle('mcp:read', () => readMcpServers())
+  ipcMain.handle('mcp:test', async (_event, server: unknown) => await testMcpServer(server))
+  ipcMain.handle('mcp:save', async (_event, value: unknown) => {
+    const previous = readMcpServers()
+    const servers = writeMcpServers(value)
+    try {
+      await restartDshHost()
+      return servers
+    } catch (error) {
+      writeMcpServers(previous)
+      await restartDshHost().catch(() => {})
+      throw error
+    }
+  })
+  ipcMain.handle('models:providers:read', () => readModelProviders())
+  ipcMain.handle('models:providers:test', async (_event, provider: unknown) => await testModelProvider(provider))
+  ipcMain.handle('models:providers:test-model', async (_event, provider: unknown, modelId: unknown) => await testProviderModel(provider, modelId))
+  ipcMain.handle('models:providers:save', async (_event, value: unknown) => {
+    const providers = writeModelProviders(value)
+    scheduleRuntimeReload('models')
+    return providers
+  })
+  ipcMain.handle('runtime:config-status', () => runtimeConfigStatus)
+  ipcMain.handle('runtime:restart', () => queuePluginMutation(async () => restartDshHost()))
+  ipcMain.handle('ocr:read', () => readLawClawConfig().ocr)
+  ipcMain.handle('ocr:save', (_event, value: unknown) => {
+    const config = readLawClawConfig()
+    const ocr = normalizeOcrSettings(value)
+    writeLawClawConfig({ ...config, ocr })
+    syncOcrRuntimeSettings(ocr)
+    return ocr
+  })
+  ipcMain.handle('ocr:capabilities', async () => {
+    const settings = readLawClawConfig().ocr
+    return await inspectOcrCapabilities(settings, desktopRoot(), lawClawResourcesRoot())
+  })
+  ipcMain.handle('ocr:install-gpu', async () => {
+    return await installOcrGpuAcceleration(readLawClawConfig().ocr, desktopRoot(), lawClawResourcesRoot())
+  })
+  ipcMain.handle('ocr:provision', async () => {
+    return await provisionOcrRuntime(readLawClawConfig().ocr, desktopRoot(), lawClawResourcesRoot())
+  })
+  ipcMain.handle('ocr:choose-benchmark-file', async () => {
+    if (mainWindow === undefined) return undefined
+    const result = await dialog.showOpenDialog(mainWindow, {
+      title: '选择一份扫描材料测速',
+      buttonLabel: '开始本地测速',
+      filters: [{ name: '案件材料', extensions: ['pdf', 'png', 'jpg', 'jpeg'] }],
+      properties: ['openFile'],
+    })
+    return result.canceled ? undefined : result.filePaths[0]
+  })
+  ipcMain.handle('ocr:benchmark', async (_event, filePath: string) => {
+    if (typeof filePath !== 'string' || !existsSync(filePath) || !statSync(filePath).isFile()) throw new Error('测速材料不存在或不可读取。')
+    const settings = readLawClawConfig().ocr
+    return await benchmarkOcr(settings, filePath, desktopRoot(), lawClawResourcesRoot())
+  })
+  ipcMain.handle('ocr:choose-cloud-file', async () => {
+    if (mainWindow === undefined) return undefined
+    const result = await dialog.showOpenDialog(mainWindow, {
+      title: '选择一份材料测试云端 OCR',
+      buttonLabel: '选择材料',
+      filters: [{ name: '案件材料', extensions: ['pdf', 'png', 'jpg', 'jpeg'] }],
+      properties: ['openFile'],
+    })
+    return result.canceled ? undefined : result.filePaths[0]
+  })
+  ipcMain.handle('ocr:cloud-test', async (_event, filePath: string, explicitlyAuthorized: boolean) => {
+    if (explicitlyAuthorized !== true) throw new Error('未取得本次上传授权，材料不会发送。')
+    if (typeof filePath !== 'string' || !existsSync(filePath) || !statSync(filePath).isFile()) throw new Error('云端 OCR 材料不存在或不可读取。')
+    return await invokeCloudOcr(readLawClawConfig().ocr, filePath)
+  })
   ipcMain.handle('settings:read', () => readDesktopEnv())
   ipcMain.handle('settings:write', async (_event, env: Record<string, string>) => {
     const previous = readDesktopEnv()
@@ -322,15 +588,15 @@ async function bootstrap(): Promise<void> {
   ipcMain.handle('models:fetch', async (_event, baseUrl: string, apiKey: string) => {
     const url = `${baseUrl.replace(/\/+$/, '')}/models`
     const response = await fetch(url, { headers: { Authorization: `Bearer ${apiKey}`, Accept: 'application/json' } })
-    if (!response.ok) throw new Error(`拉取模型失败：${String(response.status)} ${response.statusText}`)
+    if (!response.ok) throw new Error(httpFailureMessage('拉取模型失败', response.status, response.statusText, await response.text().catch(() => '')))
     const json = (await response.json()) as { data?: Array<{ id: string }> }
     return json.data?.map((model) => model.id).filter((id) => id !== '') ?? []
   })
   ipcMain.handle('project:choose-directory', async () => {
     if (mainWindow === undefined) return undefined
     const result = await dialog.showOpenDialog(mainWindow, {
-      title: '选择项目文件夹',
-      buttonLabel: '在 DeepSeek 中打开',
+      title: '选择案件材料目录',
+      buttonLabel: '添加到 LawClaw',
       properties: ['openDirectory', 'createDirectory'],
     })
     return result.canceled ? undefined : result.filePaths[0]
@@ -340,9 +606,9 @@ async function bootstrap(): Promise<void> {
   ipcMain.handle('attachments:choose-images', async () => {
     if (mainWindow === undefined) return []
     const result = await dialog.showOpenDialog(mainWindow, {
-      title: '添加图片上下文',
-      buttonLabel: '添加到任务',
-      filters: [{ name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'webp', 'gif'] }],
+      title: '添加案件图片材料',
+      buttonLabel: '添加到当前分析',
+      filters: [{ name: '图片材料', extensions: ['png', 'jpg', 'jpeg', 'webp', 'gif'] }],
       properties: ['openFile', 'multiSelections'],
     })
     if (result.canceled) return []

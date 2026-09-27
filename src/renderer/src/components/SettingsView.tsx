@@ -1,13 +1,20 @@
 import { useCallback, useEffect, useState } from 'react'
-import { dsh } from '../dsh-client'
 import { useApp } from '../store'
 import type { ProjectEnvironment } from '../types'
-import { BrandMark, Icon } from './Icon'
+import { friendlyErrorText } from '../friendly-error'
+import { Icon } from './Icon'
+import { OcrSettingsPane } from './OcrSettingsPane'
+import { McpSettingsPane } from './McpSettingsPane'
+import { ModelProvidersPane } from './ModelProvidersPane'
+import { SelfCheckPane } from './SelfCheckPane'
+import { SkillSettingsPane } from './SkillSettingsPane'
+import { SettingsToasts } from './SettingsToasts'
 
-type SettingsTab =
-  | 'general' | 'appearance' | 'models' | 'presets'
-  | 'plugins' | 'connections'
+export type SettingsTab =
+  | 'general' | 'appearance' | 'models' | 'ocr' | 'agents' | 'presets'
+  | 'skills' | 'mcp' | 'connections'
   | 'hooks' | 'git' | 'environment' | 'worktrees' | 'shortcuts'
+  | 'selfcheck'
 
 const tabGroups = [
   {
@@ -16,23 +23,21 @@ const tabGroups = [
       { id: 'general', label: '通用设置', icon: 'settings' },
       { id: 'appearance', label: '外观', icon: 'monitor' },
       { id: 'models', label: '模型', icon: 'cache' },
-      { id: 'presets', label: 'Agent 预设', icon: 'sparkles' },
+      { id: 'ocr', label: '材料识别', icon: 'activity' },
     ],
   },
   {
-    label: '集成',
+    label: '能力',
     items: [
-      { id: 'plugins', label: '插件', icon: 'grid' },
-      { id: 'connections', label: '连接', icon: 'link' },
+      { id: 'skills', label: '技能管理', icon: 'grid' },
+      { id: 'mcp', label: 'MCP 服务', icon: 'link' },
     ],
   },
   {
-    label: '编码',
+    label: '支持',
     items: [
-      { id: 'hooks', label: '钩子', icon: 'command' },
-      { id: 'git', label: 'Git', icon: 'branch' },
-      { id: 'environment', label: '环境', icon: 'terminal' },
-      { id: 'worktrees', label: 'Worktrees', icon: 'layers' },
+      { id: 'selfcheck', label: '程序自检', icon: 'activity' },
+      { id: 'environment', label: '运行诊断', icon: 'terminal' },
       { id: 'shortcuts', label: '键盘快捷键', icon: 'keyboard' },
     ],
   },
@@ -59,15 +64,17 @@ const GIT_SETTINGS_KEY = 'deepseek-desktop:git-settings'
 const WORKTREE_SETTINGS_KEY = 'deepseek-desktop:worktree-settings'
 const SETTINGS_TAB_KEY = 'deepseek-desktop:settings-tab'
 const settingsTabIds: readonly SettingsTab[] = [
-  'general', 'appearance', 'models', 'presets',
-  'plugins', 'connections',
-  'hooks', 'git', 'environment', 'worktrees', 'shortcuts',
+  'general', 'appearance', 'models', 'ocr', 'skills', 'mcp', 'environment', 'shortcuts',
 ]
+
+function developerModeEnabled(): boolean {
+  return localStorage.getItem('deepseek-desktop.developer-mode.v1') === 'true'
+}
 
 function initialSettingsTab(): SettingsTab {
   const requested = localStorage.getItem(SETTINGS_TAB_KEY)
   localStorage.removeItem(SETTINGS_TAB_KEY)
-  return settingsTabIds.some((id) => id === requested)
+  return settingsTabIds.some((id) => id === requested) && (requested !== 'selfcheck' || developerModeEnabled())
     ? requested as SettingsTab
     : 'general'
 }
@@ -145,15 +152,6 @@ function resolvedAppearance(value: 'light' | 'dark' | 'system'): 'light' | 'dark
     : value
 }
 
-function comparableModelId(value: string): string {
-  return (value.split('/').at(-1) ?? value).toLowerCase().replace(/[^a-z0-9]+/gu, '')
-}
-
-function matchingModelId(ids: readonly string[], selected: string): string | undefined {
-  return ids.find((id) => id === selected)
-    ?? ids.find((id) => comparableModelId(id) === comparableModelId(selected))
-}
-
 export function SettingsView(): React.ReactElement {
   const setView = useApp((state) => state.setView)
   const workspaceRoot = useApp((state) => state.workspaceRoot)
@@ -161,18 +159,10 @@ export function SettingsView(): React.ReactElement {
   const setAgentPreset = useApp((state) => state.setAgentPreset)
   const appearance = useApp((state) => state.appearance)
   const setAppearance = useApp((state) => state.setAppearance)
-  const activeSessionId = useApp((state) => state.activeSessionId)
-  const sessions = useApp((state) => state.sessions)
-  const patchSession = useApp((state) => state.patchSession)
+  const developerMode = useApp((state) => state.developerMode)
+  const setDeveloperMode = useApp((state) => state.setDeveloperMode)
+  const pushToast = useApp((state) => state.pushToast)
   const [tab, setTab] = useState<SettingsTab>(initialSettingsTab)
-  const [apiKey, setApiKey] = useState('')
-  const [baseUrl, setBaseUrl] = useState('')
-  const [desktopEnv, setDesktopEnv] = useState<Record<string, string>>({})
-  const [saved, setSaved] = useState(false)
-  const [loading, setLoading] = useState(true)
-  const [saving, setSaving] = useState(false)
-  const [fetching, setFetching] = useState(false)
-  const [fetchMessage, setFetchMessage] = useState<string | undefined>()
   const [error, setError] = useState<string | undefined>()
   const [environment, setEnvironment] = useState<ProjectEnvironment | undefined>()
   const [environmentLoading, setEnvironmentLoading] = useState(false)
@@ -206,15 +196,8 @@ export function SettingsView(): React.ReactElement {
   }
 
   useEffect(() => {
-    void window.desktop.settings.read()
-      .then((env) => {
-        setDesktopEnv(env)
-        setApiKey(env.DEEPSEEK_API_KEY ?? '')
-        setBaseUrl(env.DEEPSEEK_BASE_URL ?? '')
-      })
-      .catch((reason: unknown) => setError(reason instanceof Error ? reason.message : String(reason)))
-      .finally(() => setLoading(false))
-  }, [])
+    if (!developerMode && tab === 'selfcheck') setTab('general')
+  }, [developerMode, tab])
 
   const refreshEnvironment = useCallback(async (): Promise<void> => {
     if (workspaceRoot === undefined) {
@@ -225,7 +208,7 @@ export function SettingsView(): React.ReactElement {
     try {
       setEnvironment(await window.desktop.project.environment(workspaceRoot))
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason))
+      pushToast('error', friendlyErrorText(reason))
     } finally {
       setEnvironmentLoading(false)
     }
@@ -242,63 +225,6 @@ export function SettingsView(): React.ReactElement {
   useEffect(() => {
     localStorage.setItem(WORKTREE_SETTINGS_KEY, JSON.stringify(worktreeSettings))
   }, [worktreeSettings])
-
-  async function save(): Promise<void> {
-    setSaving(true)
-    setError(undefined)
-    const env: Record<string, string> = { ...desktopEnv }
-    delete env.DEEPSEEK_API_KEY
-    delete env.DEEPSEEK_BASE_URL
-    if (apiKey.trim() !== '') env.DEEPSEEK_API_KEY = apiKey.trim()
-    if (baseUrl.trim() !== '') env.DEEPSEEK_BASE_URL = baseUrl.trim()
-    try {
-      await window.desktop.settings.write(env)
-      setDesktopEnv(env)
-      setSaved(true)
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason))
-    } finally {
-      setSaving(false)
-    }
-  }
-
-  async function fetchModels(): Promise<void> {
-    if (apiKey.trim() === '' || baseUrl.trim() === '') {
-      setError('请先填写 API Key 与 Base URL')
-      return
-    }
-    setFetching(true)
-    setError(undefined)
-    setFetchMessage(undefined)
-    try {
-      const ids = await window.desktop.models.fetch(baseUrl.trim(), apiKey.trim())
-      if (ids.length === 0) {
-        setError('该 URL 未返回任何模型')
-        return
-      }
-      const models = ids.map((id) => ({ id, name: id, contextWindow: 64000, maxTokens: 8192, inputModalities: ['text'] }))
-      await dsh.updateDeepSeekModels(models)
-      const catalog = await dsh.modelCatalog()
-      const activeSelection = sessions.find((session) => session.id === activeSessionId)?.selectedModel
-      const current = activeSelection ?? catalog.default
-      const matched = matchingModelId(ids, current.model)
-      if (activeSessionId !== undefined && current.provider === 'deepseek-official' && matched !== undefined && matched !== current.model) {
-        const accepted = await dsh.selectModel({
-          sessionId: activeSessionId,
-          provider: current.provider,
-          model: matched,
-        })
-        patchSession(activeSessionId, { selectedModel: accepted.selected })
-        setFetchMessage(`已加载 ${String(ids.length)} 个模型，并将当前模型匹配为 ${accepted.selected.model}`)
-      } else {
-        setFetchMessage(`已加载 ${String(ids.length)} 个模型，回到对话即可在下拉选择`)
-      }
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason))
-    } finally {
-      setFetching(false)
-    }
-  }
 
   function saveSshProfile(event: React.FormEvent): void {
     event.preventDefault()
@@ -348,16 +274,13 @@ export function SettingsView(): React.ReactElement {
   return (
     <div className="surface-view settings-view">
       <section className="settings-window">
-        <header className="settings-window-header titlebar-drag">
-          <h1>设置</h1>
-          <button aria-label="关闭设置" className="icon-button subtle titlebar-no-drag" onClick={() => setView('chat')} type="button"><Icon name="close" size={17} /></button>
-        </header>
         <div className="settings-layout">
           <aside className="settings-nav">
+            <button className="settings-back-button" onClick={() => setView('chat')} type="button"><Icon name="chevron-left" size={17} /><span>返回工作台</span></button>
             {tabGroups.map((group) => (
               <div className="settings-nav-section" key={group.label}>
                 <span>{group.label}</span>
-                {group.items.map((item) => (
+                {group.items.filter((item) => item.id !== 'selfcheck' || developerMode).map((item) => (
                   <button className={tab === item.id ? 'is-active' : ''} key={item.id} onClick={() => setTab(item.id)} type="button">
                     <Icon name={item.icon} size={17} />
                     <span>{item.label}</span>
@@ -368,13 +291,14 @@ export function SettingsView(): React.ReactElement {
           </aside>
 
           <div className="settings-detail">
-            {error !== undefined && <div className="notice notice-error"><span><Icon name="activity" size={16} /></span><p>{error}</p><button aria-label="关闭错误" onClick={() => setError(undefined)} type="button"><Icon name="close" size={14} /></button></div>}
-
             {tab === 'general' && (
               <SettingsPane eyebrow="GENERAL" title="通用设置" description="这些选项用于之后创建的新任务。">
                 <div className="preference-list">
-                  <PreferenceRow title="Agent 预设" description="新任务默认加载的插件组合">
-                    <button onClick={() => setTab('presets')} type="button">{presets.find((preset) => preset.id === agentPreset)?.name}<Icon name="chevron-right" size={14} /></button>
+                  <PreferenceRow title="协作工作流" description="编排步骤、模型、技能和任务流转">
+                    <button onClick={() => setView('automations')} type="button">前往自动化<Icon name="chevron-right" size={14} /></button>
+                  </PreferenceRow>
+                  <PreferenceRow title="开发者模式" description="显示“程序自检”选项卡，可检测并一键修复本机资源；提示中保留技术细节。">
+                    <SettingsToggle checked={developerMode} label="开发者模式" onChange={setDeveloperMode} />
                   </PreferenceRow>
                   <PreferenceRow title="权限" description="工作目录内可读写，其他操作按需确认">
                     <span className="preference-pill">Workspace Write</span>
@@ -405,49 +329,18 @@ export function SettingsView(): React.ReactElement {
               </SettingsPane>
             )}
 
-            {tab === 'models' && (
-              <SettingsPane eyebrow="MODEL PROVIDERS" title="模型" description="配置 DeepSeek 提供方。凭证保存在桌面应用的数据目录中。">
-                <div className="settings-card provider-card">
-                  <div className="provider-heading">
-                    <span className="provider-mark"><BrandMark size={34} /></span>
-                    <div><strong>DeepSeek Official</strong><small>主模型路由 · 缓存优化</small></div>
-                    <span className={`status-badge ${apiKey === '' ? 'is-muted' : ''}`}><i />{apiKey === '' ? '待配置' : '已配置'}</span>
-                  </div>
-                  <label className="field">
-                    <span>API Key</span>
-                    <input disabled={loading} onChange={(event) => { setApiKey(event.target.value); setSaved(false) }} placeholder="sk-…" type="password" value={apiKey} />
-                  </label>
-                  <label className="field">
-                    <span>Base URL <small>可选</small></span>
-                    <input disabled={loading} onChange={(event) => { setBaseUrl(event.target.value); setSaved(false) }} placeholder="https://api.deepseek.com" type="url" value={baseUrl} />
-                  </label>
-                  <div className="settings-card-actions">
-                    {saved && <span className="saved-message"><Icon name="check" size={14} />已保存并应用</span>}
-                    {fetchMessage !== undefined && <span className="saved-message"><Icon name="check" size={14} />{fetchMessage}</span>}
-                    <button className="button" disabled={fetching || apiKey.trim() === '' || baseUrl.trim() === ''} onClick={() => void fetchModels()} type="button">{fetching ? '拉取中…' : '拉取可用模型'}</button>
-                    <button className="button button-primary" disabled={loading || saving} onClick={() => void save()} type="button">{saving ? '保存中…' : '保存配置'}</button>
-                  </div>
-                </div>
-              </SettingsPane>
-            )}
+            {tab === 'models' && <ModelProvidersPane />}
 
-            {tab === 'plugins' && (
-              <SettingsPane eyebrow="PLUGIN RUNTIME" title="插件" description="配置核心能力或从社区目录安装新的 Harness 组件。">
-                <div className="plugin-config-list">
-                  <PluginConfigRow icon="terminal" title="终端" description="限制 Agent 运行的每一条命令。" />
-                  <PluginConfigRow icon="activity" title="Agent 循环" description="控制模型、工具与后续步骤的派发。" />
-                  <PluginConfigRow icon="search" title="网页搜索" description="由 DeepSeek 搜索提供方处理联网检索。" />
-                  <PluginConfigRow icon="cache" title="缓存路由" description="稳定提示词前缀并保持高缓存命中。" />
-                </div>
-                <div className="settings-callout">
-                  <div><Icon name="grid" /><span><strong>社区插件市场</strong><small>浏览、筛选和安装社区插件。</small></span></div>
-                  <button className="button" onClick={() => setView('plugins')} type="button">打开市场<Icon name="chevron-right" size={14} /></button>
-                </div>
-              </SettingsPane>
-            )}
+            {tab === 'ocr' && <OcrSettingsPane />}
+
+            {tab === 'skills' && <SkillSettingsPane />}
+
+            {tab === 'mcp' && <McpSettingsPane />}
+
+            {tab === 'selfcheck' && <SelfCheckPane onNavigate={(next) => { if (next === 'agents') setView('automations'); else if (next !== undefined) setTab(next) }} />}
 
             {tab === 'presets' && (
-              <SettingsPane eyebrow="AGENT PRESETS" title="Agent 预设" description="选择任务使用的插件组合、工具与运行方式。">
+              <SettingsPane eyebrow="AGENT PRESETS" title="Agent 预设" description="选择 DSH 任务使用的工具组合与运行方式。法律角色请在“五 Agent 协作”中配置。">
                 <span className="settings-subheading">内置</span>
                 <div className="preset-grid">
                   {presets.map((preset) => (
@@ -484,14 +377,14 @@ export function SettingsView(): React.ReactElement {
             )}
 
             {tab === 'hooks' && (
-              <SettingsPane eyebrow="HOOKS" title="钩子" description="钩子由 DSH 插件定义，并在对应生命周期运行。">
+              <SettingsPane eyebrow="HOOKS" title="钩子" description="钩子由 DSH 运行时能力定义，并在对应生命周期运行。">
                 <div className="preference-list hook-list">
                   <PreferenceRow title="任务开始前" description="在模型接收新任务前执行"><span className="preference-pill is-muted">未配置</span></PreferenceRow>
                   <PreferenceRow title="工具调用前" description="在 Shell、编辑或其他工具执行前运行"><span className="preference-pill is-muted">未配置</span></PreferenceRow>
                   <PreferenceRow title="工具调用后" description="工具返回结果后运行"><span className="preference-pill is-muted">未配置</span></PreferenceRow>
                   <PreferenceRow title="任务完成后" description="Agent 结束当前轮次后运行"><span className="preference-pill is-muted">未配置</span></PreferenceRow>
                 </div>
-                <div className="settings-inline-action"><span>安装或配置钩子插件后，状态会由 DSH 运行时接管。</span><button className="button" onClick={() => setTab('plugins')} type="button">查看插件</button></div>
+                <div className="settings-inline-action"><span>配置相关技能后，状态会由 DSH 运行时接管。</span><button className="button" onClick={() => setTab('skills')} type="button">查看技能</button></div>
               </SettingsPane>
             )}
 
@@ -608,8 +501,8 @@ export function SettingsView(): React.ReactElement {
             {tab === 'shortcuts' && (
               <SettingsPane eyebrow="KEYBOARD" title="键盘快捷键" description="当前可用的桌面操作快捷键。">
                 <div className="shortcut-list">
-                  <ShortcutRow keys={['Ctrl', 'N']} label="新建任务" />
-                  <ShortcutRow keys={['Ctrl', 'K']} label="搜索任务" />
+                  <ShortcutRow keys={['Ctrl', 'N']} label="新建案件分析" />
+                  <ShortcutRow keys={['Ctrl', 'K']} label="搜索案件" />
                   <ShortcutRow keys={['Enter']} label="发送消息" />
                   <ShortcutRow keys={['Shift', 'Enter']} label="消息内换行" />
                   <ShortcutRow keys={['Esc']} label="关闭菜单或浮层" />
@@ -618,6 +511,7 @@ export function SettingsView(): React.ReactElement {
             )}
           </div>
         </div>
+        <SettingsToasts />
       </section>
       {sshDialogOpen && (
         <div className="settings-dialog-backdrop" onPointerDown={(event) => { if (event.target === event.currentTarget) closeSshDialog() }}>
@@ -713,10 +607,6 @@ function SettingsTextArea({ title, description, value, placeholder, onChange }: 
       <textarea onChange={(event) => onChange(event.target.value)} placeholder={placeholder} rows={3} value={value} />
     </div>
   )
-}
-
-function PluginConfigRow({ icon, title, description }: { icon: 'terminal' | 'activity' | 'search' | 'cache'; title: string; description: string }): React.ReactElement {
-  return <div className="plugin-config-row"><span><Icon name={icon} size={17} /></span><div><strong>{title}</strong><small>{description}</small></div><span className="enabled-dot" /><span className="plugin-config-status">已启用</span></div>
 }
 
 function EnvironmentToolbar({ root, loading, onRefresh }: { root: string | undefined; loading: boolean; onRefresh: () => void }): React.ReactElement {

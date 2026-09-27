@@ -1,13 +1,14 @@
 import { Fragment, useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { dsh } from '../dsh-client'
+import { visibleLawClawTitle } from '../lawclaw-display'
 import { PROJECT_PREFERENCES_KEY, useApp, type DesktopSession } from '../store'
 import type { View } from '../types'
 import { BrandMark, Icon } from './Icon'
 
 const NAV: ReadonlyArray<{ id: View; label: string; icon: 'grid' | 'clock' }> = [
   { id: 'automations', label: '自动化', icon: 'clock' },
-  { id: 'plugins', label: '插件', icon: 'grid' },
+  { id: 'skills', label: '技能', icon: 'grid' },
 ]
 
 function projectName(path: string | undefined): string {
@@ -115,7 +116,6 @@ export function Sidebar(): React.ReactElement {
   const [sessionRenameDraft, setSessionRenameDraft] = useState('')
   const [archiveConfirmId, setArchiveConfirmId] = useState<string | undefined>()
   const [projectDialogOpen, setProjectDialogOpen] = useState(false)
-  const [projectKind, setProjectKind] = useState<'local' | 'remote'>('local')
   const searchRef = useRef<HTMLInputElement>(null)
   const projectMenuRef = useRef<HTMLDivElement>(null)
   const sessionMenuRef = useRef<HTMLDivElement>(null)
@@ -356,7 +356,6 @@ export function Sidebar(): React.ReactElement {
   async function createSession(cwd = workspaceRoot): Promise<void> {
     if (creating || dshUrl === undefined) return
     if (cwd === undefined) {
-      setProjectKind('local')
       setProjectDialogOpen(true)
       return
     }
@@ -403,12 +402,6 @@ export function Sidebar(): React.ReactElement {
   }
 
   async function continueProjectCreation(): Promise<void> {
-    if (projectKind === 'remote') {
-      localStorage.setItem('deepseek-desktop:settings-tab', 'connections')
-      setProjectDialogOpen(false)
-      setView('settings')
-      return
-    }
     setProjectDialogOpen(false)
     await chooseProject()
   }
@@ -492,8 +485,8 @@ export function Sidebar(): React.ReactElement {
         >
           <BrandMark size={26} />
           <span className="brand-copy">
-            <strong>DeepSeek</strong>
-            <small>Harness</small>
+            <strong>LawClaw</strong>
+            <small>Next</small>
           </span>
         </button>
         <button
@@ -510,16 +503,16 @@ export function Sidebar(): React.ReactElement {
         <div className="sidebar-actions">
           <button className="sidebar-action primary-action" disabled={creating || dshUrl === undefined} onClick={() => void createSession()} type="button">
             <span className="action-icon"><Icon name="plus" size={17} /></span>
-            <span>{creating ? '正在创建…' : '新建任务'}</span>
+            <span>{creating ? '正在创建…' : '新建案件分析'}</span>
             <kbd>Ctrl N</kbd>
           </button>
           {searchOpen ? (
             <div className="sidebar-search">
               <Icon name="search" size={16} />
               <input
-                aria-label="搜索任务"
+                aria-label="搜索案件"
                 onChange={(event) => setQuery(event.target.value)}
-                placeholder="搜索任务或项目"
+                placeholder="搜索案件或分析记录"
                 ref={searchRef}
                 value={query}
               />
@@ -550,15 +543,15 @@ export function Sidebar(): React.ReactElement {
         <div className="sidebar-divider" />
 
         <div className="projects-heading">
-          <span>项目</span>
-          <button aria-label="创建项目" className="icon-button subtle project-create-trigger" onClick={() => setProjectDialogOpen(true)} type="button">
+          <span>案件</span>
+          <button aria-label="添加案件目录" className="icon-button subtle project-create-trigger" onClick={() => setProjectDialogOpen(true)} type="button">
             <Icon name="folder-plus" size={16} />
           </button>
         </div>
 
         <div className="session-scroll">
           {groups.length === 0 ? (
-            <div className="sidebar-empty">{query === '' ? '还没有任务' : '没有匹配结果'}</div>
+            <div className="sidebar-empty">{query === '' ? '还没有案件，点击上方添加' : '没有匹配结果'}</div>
           ) : groups.map((group, groupIndex) => {
             const collapsed = projectPreferences.collapsed.includes(group.key)
             const pinned = projectPreferences.pinned.includes(group.key)
@@ -600,7 +593,7 @@ export function Sidebar(): React.ReactElement {
                   <button
                     aria-expanded={menuOpen}
                     aria-haspopup="menu"
-                    aria-label={`${group.label} 项目菜单`}
+                    aria-label={`${group.label} 案件菜单`}
                     className="project-more"
                     onClick={(event) => {
                       if (menuOpen) closeProjectMenu()
@@ -621,7 +614,7 @@ export function Sidebar(): React.ReactElement {
                   <div className="project-menu is-floating" ref={projectMenuRef} role="menu" style={{ left: projectMenuPosition.left, top: projectMenuPosition.top }}>
                     {renamingKey === group.key ? (
                       <form className="project-rename-form" onSubmit={(event) => { event.preventDefault(); void saveRename(group) }}>
-                        <label htmlFor={`project-name-${group.key}`}>项目名称</label>
+                        <label htmlFor={`project-name-${group.key}`}>案件名称</label>
                         <div>
                           <input
                             autoFocus
@@ -662,7 +655,7 @@ export function Sidebar(): React.ReactElement {
                           </div>
                         )}
                         <div className="project-menu-divider" />
-                        <span className="project-menu-caption">移动项目</span>
+                        <span className="project-menu-caption">移动案件</span>
                         <button disabled={movableIndex <= 0} onClick={() => void moveProject(group, -1)} role="menuitem" type="button">
                           <Icon name="arrow-up" size={15} /><span>上移</span>
                         </button>
@@ -672,9 +665,9 @@ export function Sidebar(): React.ReactElement {
                         <div className="project-menu-divider" />
                         <button className="project-menu-danger" onClick={() => void removeProject(group)} role="menuitem" type="button">
                           <Icon name="trash" size={15} />
-                          <span>{removeConfirmKey === group.key ? '再次点击确认移除' : '移除项目'}</span>
+                          <span>{removeConfirmKey === group.key ? '再次点击确认移除' : '移除案件'}</span>
                         </button>
-                        {removeConfirmKey === group.key && <small className="project-remove-note">只从侧栏移除，不会删除磁盘文件。</small>}
+                        {removeConfirmKey === group.key && <small className="project-remove-note">只从侧栏移除，不会删除原始案件材料。</small>}
                       </>
                     )}
                   </div>
@@ -697,13 +690,13 @@ export function Sidebar(): React.ReactElement {
                         type="button"
                       >
                         <span className={`session-presence ${session.running ? 'is-running' : ''}`} />
-                        <span className="session-title">{session.title}</span>
+                        <span className="session-title">{visibleLawClawTitle(session.title)}</span>
                         <span className="session-time">{relativeTime(session.updatedAt)}</span>
                       </button>
                       <button
                         aria-expanded={menuOpen}
                         aria-haspopup="menu"
-                        aria-label={`${session.title} 任务菜单`}
+                        aria-label={`${visibleLawClawTitle(session.title)} 任务菜单`}
                         className="session-more"
                         onClick={(event) => {
                           if (menuOpen) closeSessionMenu()
@@ -767,7 +760,7 @@ export function Sidebar(): React.ReactElement {
         <button className={`account-row ${view === 'settings' ? 'is-active' : ''}`} onClick={() => setView('settings')} type="button">
           <span className="account-avatar">D<span className={`connection-dot ${dshUrl !== undefined ? 'is-online' : 'is-offline'}`} /></span>
           <span className="account-copy">
-            <strong>DeepSeek</strong>
+            <strong>LawClaw</strong>
           </span>
           <Icon name="settings" size={16} />
         </button>
@@ -777,25 +770,19 @@ export function Sidebar(): React.ReactElement {
         <div className="project-create-backdrop" onPointerDown={(event) => { if (event.target === event.currentTarget) setProjectDialogOpen(false) }}>
           <section aria-labelledby="create-project-title" aria-modal="true" className="project-create-dialog" role="dialog">
             <header>
-              <h2 id="create-project-title">创建项目</h2>
-              <button aria-label="关闭创建项目" onClick={() => setProjectDialogOpen(false)} type="button"><Icon name="close" size={17} /></button>
+              <h2 id="create-project-title">添加案件目录</h2>
+              <button aria-label="关闭添加案件目录" onClick={() => setProjectDialogOpen(false)} type="button"><Icon name="close" size={17} /></button>
             </header>
-            <span className="project-create-label">项目类型</span>
+            <span className="project-create-label">材料保留在本机，不会因为添加目录而上传。</span>
             <div className="project-kind-grid">
-              <button className={projectKind === 'local' ? 'is-selected' : ''} onClick={() => setProjectKind('local')} type="button">
+              <button className="is-selected" onClick={() => void continueProjectCreation()} type="button">
                 <Icon name="monitor" size={21} />
                 <i aria-hidden="true" />
-                <span><strong>本地</strong><small>在你的电脑上编辑、运行和测试文件</small></span>
-              </button>
-              <button className={projectKind === 'remote' ? 'is-selected' : ''} onClick={() => setProjectKind('remote')} type="button">
-                <Icon name="globe" size={21} />
-                <i aria-hidden="true" />
-                <span><strong>远程</strong><small>通过 SSH 选择已配置主机上的工作区</small></span>
+                <span><strong>选择本地案件目录</strong><small>支持在目录中集中保存卷宗、图片和分析结果</small></span>
               </button>
             </div>
-            {projectKind === 'remote' && <p className="project-create-note">下一步将在“连接”中添加或选择 SSH 主机。</p>}
             <footer>
-              <button className="button button-primary" onClick={() => void continueProjectCreation()} type="button">{projectKind === 'local' ? '下一步' : '打开连接设置'}</button>
+              <button className="button button-primary" onClick={() => void continueProjectCreation()} type="button">选择目录</button>
             </footer>
           </section>
         </div>

@@ -73,7 +73,7 @@ export function Icon({ name, size = 18, strokeWidth = 1.7, className }: IconProp
 
 export function BrandMark({ size = 28, muted = false }: { size?: number; muted?: boolean }): React.ReactElement {
   return (
-    <svg aria-label="DeepSeek Harness" className="brand-mark" height={size} viewBox="0 0 32 32" width={size}>
+    <svg aria-label="LawClaw Next" className="brand-mark" height={size} viewBox="0 0 32 32" width={size}>
       <rect width="32" height="32" rx="8.5" fill={muted ? '#e7e6e2' : '#20211f'} />
       <path d="M8 18.2c2.3-6.6 8-8.8 16-7.7-1.8 1.1-3.4 2.7-4.4 4.8 1.7-.3 3.2 0 4.5.8-3.5 5.1-8.2 7-14.1 5.4 2.4-.4 4.5-1.3 6.3-2.9-3.1 1-5.8.9-8.3-.4Z" fill={muted ? '#777873' : '#f4f4ef'} />
       <circle cx="21.7" cy="13.8" r="1.05" fill={muted ? '#e7e6e2' : '#20211f'} />

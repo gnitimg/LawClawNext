@@ -5,8 +5,8 @@
     {
       "name": "deepseek-harness-sdk-runtime-win-x64.exe",
       "compressed": "deepseek-harness-sdk-runtime-win-x64.exe.br",
-      "size": 243018240,
-      "sha256": "a4265be982f0a46ed701ae03901f682d7e90f149770dfee356f99ab877fd0bc8"
+      "size": 240529920,
+      "sha256": "7ff077cfa28b81aa33f96aca97911969f8b6499bc1f85e4a6d3ddd16b8aa67d6"
     },
     {
       "name": "deepseek-harness-sdk-runtime-win-x64-rg.exe",

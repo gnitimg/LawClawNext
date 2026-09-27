@@ -1,0 +1,11 @@
+allowBuilds:
+  '@deepseek-ai/dsh-subprocess-local': true
+  '@google/genai': true
+  electron: true
+  electron-winstaller: true
+  esbuild: true
+  koffi: true
+  node-pty: true
+  protobufjs: true
+patchedDependencies:
+  '@deepseek-ai/dsh-win32-process@0.1.5-rc.2': patches/@deepseek-ai__dsh-win32-process@0.1.5-rc.2.patch
